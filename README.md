@@ -119,14 +119,14 @@ The code uses the HUD USPS ZIP Code Crosswalk API to match respondent ZIP codes 
 ## File Structure
 
 ```
-final_analyses/
+permitless-carry-analysis/
 ├── weight_creation_v2.Rmd              # Survey weighting procedure
 ├── everytown_analyses_V3_github.Rmd    # Main analysis script
-├── calculate_income_targets.R          # Helper script for income targets
 ├── README.md                            # This file
-├── .gitignore                           # Git ignore rules
-├── data/                                # Data files (NOT included - see above)
-└── output/                              # Generated tables/figures
+├── LICENSE                              # MIT License
+└── .gitignore                           # Git ignore rules
+
+Note: data/ and output/ folders are not included in this repository (see External Data section above).
 ```
 
 ## Reproducibility Notes

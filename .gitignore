@@ -1,0 +1,22 @@
+# Data files (contain PII - not included in repository)
+data/
+*.csv
+
+# Output files
+output/
+*.xlsx
+*.docx
+
+# R artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large/binary files
+*.pdf
+*.wav
