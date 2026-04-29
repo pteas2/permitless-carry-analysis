@@ -1,0 +1,4036 @@
+---
+editor_options:
+  chunk_output_type: console
+  ---
+
+```{r Notes}
+# Before loading this dataset, I recoded some of the Q80 responses, the open text where people indicated whether they open carried, concealed carried, etc. That's what the current data set is we're loading
+
+# Shouldn't use weights here unless we are estimate descriptive data within the whole dataset. When we do analyses on just gun-owners, the weighting scheme will be thrown off because we're subsetting the data so much that the weights no longer make sense
+
+# Missing state gun ownership data from DC so models exclude data from DC
+```
+
+```{r Load libraries}
+# Data import/export
+library(haven)
+library(MASS)        # Load before tidyverse so dplyr::select takes precedence
+library(tidyverse)
+library(openxlsx)
+library(httr)
+
+# Modeling
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(estimatr)
+library(survey)
+library(nnet)
+library(ordinal)
+
+# Tidying & robust SEs
+library(broom)
+library(broom.mixed)
+library(sandwich)
+library(lmtest)
+library(clubSandwich)
+
+# Tables & output
+library(flextable)
+library(officer)
+library(modelsummary)
+library(glue)
+
+# Misc
+library(usmap)
+library(audio)
+
+dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r Utility functions}
+# Resolve state abbreviations to full names
+resolve_state_name <- function(x) {
+  full1 <- state.name[match(toupper(x), state.abb)]
+  full2 <- ifelse(x %in% state.name, x, NA_character_)
+  ifelse(!is.na(full1), full1, full2)
+}
+
+# Significance stars for p-values
+sig_stars <- function(p) {
+  dplyr::case_when(
+    p < .001 ~ "***",
+    p < .01  ~ "**",
+    p < .05  ~ "*",
+    p < .10  ~ "+",
+    TRUE     ~ ""
+  )
+}
+
+# Create matched sample with complete cases for all model variables
+make_matched_sample <- function(dv, data, individual_controls, state_sets) {
+  all_state_covs <- unique(unlist(state_sets))
+  rhs <- paste("cc_no_permit",
+               individual_controls,
+               paste(all_state_covs, collapse = " + "),
+               sep = " + ")
+
+  vars <- all.vars(as.formula(paste(dv, "~", rhs)))
+  vars <- unique(c(vars, "state"))
+
+  missing_vars <- setdiff(vars, names(data))
+  if (length(missing_vars)) {
+    stop("These variables are missing from `data`: ",
+         paste(missing_vars, collapse = ", "))
+  }
+
+  n0 <- nrow(data)
+  out <- data %>% dplyr::filter(dplyr::if_all(dplyr::all_of(vars), ~ !is.na(.)))
+  n1 <- nrow(out)
+
+  message("Matched-sample rows: ", n1, " (from ", n0, "). ",
+          "Dropped ", n0 - n1, " rows with any missing among: ",
+          paste(vars, collapse = ", "))
+
+  out
+}
+
+# Fit survey-weighted model and extract ORs with stars
+fit_and_extract_svy <- function(formula, data) {
+  des <- svydesign(
+    ids = ~state,
+    weights = ~wgtpi,
+    data = data
+  )
+
+  m <- svyglm(formula = formula,
+              design = des,
+              family = quasibinomial())
+
+  out <- tidy(m) %>%
+    mutate(
+      OR = exp(estimate),
+      coefstars = paste0(sprintf("%.2f", OR), sig_stars(p.value))
+    ) %>%
+    dplyr::select(term, coefstars)
+
+  list(model = m, table = out)
+}
+
+# Fit GLM with cluster-robust SEs and extract ORs with stars
+fit_and_extract_crse <- function(formula, data) {
+  m <- glm(formula, data = data, family = binomial())
+
+  vc <- sandwich::vcovCL(m, cluster = data$state)
+
+  coef_names <- names(coef(m))
+  keep <- coef_names != "(Intercept)"
+  vc_reduced <- vc[keep, keep, drop = FALSE]
+
+  SE_CR <- sqrt(diag(vc_reduced))
+
+  td <- broom::tidy(m) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      SE_CR = SE_CR,
+      OR    = exp(estimate),
+      p_CR  = 2 * pnorm(-abs(estimate / SE_CR)),
+      coef_stars = paste0(sprintf("%.2f", OR), sig_stars(p_CR))
+    ) %>%
+    dplyr::select(term, coef_stars)
+
+  list(model = m, table = td)
+}
+
+# Fit mixed-effects logistic model (glmer) and extract ORs with stars
+fit_and_extract <- function(formula, data) {
+  m <- glmer(
+    formula = formula,
+    data = data,
+    family = binomial(),
+    control = glmerControl(optimizer = "bobyqa",
+                           optCtrl = list(maxfun = 2e5))
+  )
+
+  td <- tidy(m, effects = "fixed") %>%
+    mutate(
+      OR = exp(estimate),
+      coefstars = paste0(sprintf("%.2f", OR), sig_stars(p.value))
+    ) %>%
+    dplyr::select(term, coefstars)
+
+  list(model = m, table = td)
+}
+
+# Fit cumulative link mixed model (clmm) and extract coefficients with stars
+fit_and_extract_clmm <- function(formula, data) {
+  m <- clmm(
+    formula = formula,
+    data = data,
+    link = "logit",
+    Hess = TRUE
+  )
+
+  td <- tidy(m, effects = "fixed") %>%
+    filter(!term %in% "(Intercept)") %>%
+    mutate(
+      coefstars = paste0(sprintf("%.2f", estimate), sig_stars(p.value))
+    ) %>%
+    dplyr::select(term, coefstars)
+
+  list(model = m, table = td)
+}
+```
+
+```{r Load data}
+
+# load data
+dat <- read_csv("data/data_weighted_stata.csv")
+#dat <- dat %>% select(-IPAddress, -(ResponseId:LocationLongitude))
+```
+
+```{r Clean Zip Codes}
+
+str(dat$zip)
+# see how many characters we typically have
+dat %>%
+  mutate(zip_length = nchar(zip)) %>%
+  count(zip_length, name = "n_zipcodes") %>%
+  arrange(zip_length)
+# about 1,035 that aren't 5 digits
+# 1,032 are 4 digits
+
+# see any zip codes that aren't 5 numeric characters
+dat %>%
+  filter(nchar(zip) != 5 | !str_detect(zip, "^\\d{5}$")) %>%
+  count(zip, sort = TRUE)
+# Did the 4-digit ones just lose leading 0s?
+
+# are others missing leading zeros?
+dat %>%
+  filter(str_detect(zip, "^0")) %>%
+  count()
+# no, so the two 4-digit ones are likely just missing the leading zeros; can change manually; the only plausible zip codes they would be are ones with a leading zero, not with a trailing zero
+
+# go ahead and trim any white space
+dat <- dat %>%
+  mutate(zip = str_trim(zip)) #trimming any white space but not adding or removing any 0s
+
+# Recode. one had an "O" instead of a zero.
+dat <- dat %>%
+  mutate(zip = case_when(
+    zip == "O3839" ~ "03839",
+    TRUE ~ zip
+  ))
+
+# replace leading zeros that got lost in the conversion
+dat <- dat %>%
+  mutate(
+    zip = str_trim(as.character(zip)),  # make sure it's character and trim whitespace
+    zip = if_else(
+      str_detect(zip, "^\\d{1,4}$"),    # only pad ZIPs with fewer than 5 digits
+      str_pad(zip, width = 5, side = "left", pad = "0"),
+      zip                               # leave valid 5-digit and non-numeric ZIPs alone
+    )
+  )
+
+# see the character numbers now
+dat %>%
+  mutate(zip_length = nchar(zip)) %>%
+  count(zip_length, name = "n_zipcodes") %>%
+  arrange(zip_length)
+# the single 3-digit zip code got padded into 5 digits too, with 2 leading zeros
+
+```
+
+```{r Load and Clean HUD Crosswalk Key}
+
+# Get data from the HUD USPS ZIP Code Crosswalk Files API
+
+key <- "YOUR_HUD_API_KEY_HERE"  # Get your free API key at https://www.huduser.gov/hudapi/public/register
+url <- "https://www.huduser.gov/hudapi/public/usps"
+
+# Note that type is set to 1 which will return values for the ZIP to Tract file and query is set to All which will return Zip Codes in all states
+response <- httr::GET(url, query = list(type = 1, query = "All"), add_headers(Authorization = paste("Bearer", key)))
+
+#check for errors
+httr::http_error(response)
+
+#access up the output
+output <- httr::content(response)
+
+# Extract the results list
+results_list <- output$data$results
+
+# Convert list of named lists into a dataframe
+hud_key <- map_dfr(results_list, as_tibble)
+
+# see how many characters we typically have
+hud_key %>%
+  mutate(zip_length = nchar(zip)) %>%
+  count(zip_length, name = "n_zipcodes") %>%
+  arrange(zip_length)
+# they're all 5 numbers
+
+# trim any white space
+hud_key <- hud_key %>%
+  mutate(zip = str_trim(zip)) #trimming any white space but not adding or removing any 0s
+
+# right now the key has more than one row per zip code because it's mapping to tract, not just city, state, etc.
+hud_zipkey <- hud_key %>%
+  distinct(zip, state)  # make it one row per ZIP code
+
+```
+
+```{r Crosswalk with HUD Key}
+
+# join the hud data based on the zip code
+dat_merged <- dat %>%
+  left_join(hud_zipkey, by = "zip")
+
+# Check to see if it worked
+dat_merged %>%
+  mutate(match_found = !is.na(state)) %>%
+  count(match_found)
+# only 35 were unmatched
+
+# quick look at the data
+dat_merged %>%
+  dplyr::select(zip, state) %>%
+  filter(!is.na(state)) %>%
+  slice_sample(n = 10)
+
+# See which zips didn't match
+dat_merged %>%
+  filter(is.na(state)) %>%
+  count(zip) %>%
+  arrange(desc(n)) %>% 
+  print(n = Inf)
+
+# do the unmatched zips exist in the key?
+setdiff(dat_merged$zip[is.na(dat_merged$state)], hud_zipkey$zip)
+# no
+
+# I didn't get zip codes from multiple years right? Only one version?
+output$data$year
+output$data$quarter
+
+# create a zip flag column for any that didn't match before overriding some manually
+dat_merged <- dat_merged %>%
+  mutate(zip_flag = if_else(is.na(state), 1L, 0L))
+
+```
+
+```{r Manually replace unmatched zip codes and remove the rest}
+
+# Check the specific unmatched ones
+dat_merged %>%
+  filter(is.na(state)) %>%
+  count(zip) %>%
+  arrange(desc(n)) %>% 
+  print(n = Inf)
+
+# 21275 = MD - BOTH
+# 19255 = PA (IRS?) - BOTH
+# 02266 = inactive; (no longer active from USPS nor find my rep, now organized under 02116); maybe MA now
+# 08546 = inactive - BOTH
+# 18025 = inactive, maybe PA - BOTH
+# 21928 = inactive - BOTH
+# 27757 = inactive - BOTH
+# 28283 = inactive - BOTH
+# 28288 = NC - inactive on find my rep..
+# 32337 = FL - BOTH
+# 44290 = inactive - BOTH
+# 46296 = inactive - BOTH
+# 55478 = inactive - BOTH
+# 58074 = ND - BOTH
+# 60209 = inactive - BOTH
+# 75962 = TX (Stephen F Austin University) - BOTH
+# 78713 = TX - BOTH
+# 83100 = inactive - BOTH
+# 86714 = inactive - BOTH
+# 88901 = inactive - BOTH
+# 90189 = CA - BOTH
+# 90410 = CA - BOTH
+# 94142 = inactive in USPS but CA in find my rep
+# 94230 = inactive in USPS but CA in find my rep
+# 94268 = inactive in USPS but CA in find my rep
+# 94288 = inactive in USPS but CA in find my rep
+# 94299 = inactive - BOTH
+# 94394 = inactive - BOTH
+# 94529 = inactive in USPS but CA in find my rep
+# 99950 = inactive in USPS but AK in find my rep
+# M4G 2L2 = so that's Ontario
+
+dat_merged <- dat_merged %>%
+  mutate(state = case_when(
+    zip == "21275" ~ "MD",
+    zip == "19255" ~ "PA",
+    zip == "75962" ~ "TX",
+    zip == "78713" ~ "TX",
+    zip == "32337" ~ "FL",
+    zip == "58074" ~ "ND",
+    zip == "90189" ~ "CA",
+    zip == "90410" ~ "CA",
+    zip == "94142" ~ "CA",
+    zip == "94230" ~ "CA",
+    zip == "94268" ~ "CA",
+    zip == "94288" ~ "CA",
+    zip == "94529" ~ "CA",
+    zip == "99950" ~ "AK",
+    TRUE ~ state  # keep existing value for all others
+  ))
+
+# filter out rows where state is NA
+dat_merged <- dat_merged %>% 
+  filter(!is.na(state))
+
+# check to make sure no more unmatched rows
+dat_merged %>%
+  filter(is.na(state)) %>%
+  count(zip) %>%
+  arrange(desc(n)) %>% 
+  print(n = Inf)
+
+# Remove the one person from Puerto Rico cause we don't have state permissiveness data for that
+dat_merged <- dat_merged %>% 
+  filter(!state == "PR")
+```
+
+```{r Add state-level variables}
+
+# crime data
+dat_crime <- read_csv("data/state_crime_2024.csv")
+colnames(dat_crime)
+str(dat_crime)
+# Data regarding crime and solve rates come from the FBI’s Uniform Crime Reporting Program. Violent crime includes homicide, aggravated assault, robbery, and rape. Crime rates are calculated by dividing the number of estimated incidents by the total population for a given geography. Solve rates are the number of reported crimes cleared by arrest or by exceptional means divided by the number of reported crimes.
+# from https://projects.csgjusticecenter.org/tools-for-states-to-address-crime/50-state-crime-data/
+
+# trump vote share
+dat_trump <- read_csv("data/state_vote_share.csv")
+colnames(dat_trump)
+str(dat_trump)
+# calculated from official state-level returns compiled by the Federal Election Commission and publicly reported election dashboards
+
+# black population
+dat_black <- read_csv("data/state_black_population_2020.csv")
+colnames(dat_black)
+str(dat_black)
+# from census 2020
+
+# poverty
+dat_poverty <- read_csv("data/state_poverty_2024.csv")
+colnames(dat_poverty)
+str(dat_poverty)
+# from census via https://worldpopulationreview.com/state-rankings/poverty-rate-by-state and https://data.census.gov
+
+# gun ownership
+dat_gun_ownership <- read_csv("data/state_gun_ownership_2022.csv")
+colnames(dat_gun_ownership)
+str(dat_gun_ownership)
+# from https://www.rand.org/pubs/tools/TL354.html via https://worldpopulationreview.com/state-rankings/gun-ownership-by-state
+
+
+# start merging
+
+
+# helper: map full state names -> abbreviations (incl. DC)
+states_full <- c(state.name, "District of Columbia")
+states_abb  <- c(state.abb,  "DC")
+
+to_abbrev <- function(x) {
+  # x can be full names ("Alabama") or already abbreviations ("AL")
+  out <- states_abb[match(x, states_full)]
+  # if not a full name, maybe it's already an abbreviation
+  out2 <- ifelse(x %in% states_abb, x, NA_character_)
+  ifelse(!is.na(out), out, out2)
+}
+
+# 1) CRIME (violent_rate_2024)
+crime_join <- dat_crime %>%
+  mutate(state_abbrev = to_abbrev(state)) %>%
+  filter(!is.na(state_abbrev)) %>%
+  transmute(
+    state = state_abbrev,
+    violent_rate_2024
+  )
+
+# 2) TRUMP (trump_perc -> numeric)
+trump_join <- dat_trump %>%
+  rename(state_full = STATE) %>%
+  mutate(
+    state_abbrev = to_abbrev(state_full),
+    trump_perc = as.numeric(str_replace(trump_perc, "%", ""))  # e.g., "52.2%" -> 52.2
+  ) %>%
+  filter(!is.na(state_abbrev)) %>%
+  transmute(
+    state = state_abbrev,
+    trump_perc_2024 = trump_perc
+  )
+
+# 3) BLACK POP SHARE (pct_black_2020)
+black_join <- dat_black %>%
+  mutate(state_abbrev = to_abbrev(state)) %>%
+  filter(!is.na(state_abbrev)) %>%
+  transmute(
+    state = state_abbrev,
+    pct_black_2020
+  )
+
+# 4) POVERTY (pct_poverty_2024)
+poverty_join <- dat_poverty %>%
+  mutate(state_abbrev = to_abbrev(state)) %>%
+  filter(!is.na(state_abbrev)) %>%
+  transmute(
+    state = state_abbrev,
+    pct_poverty_2024
+  )
+
+# 5) GUN OWNERSHIP (pct_households_gun_own_2022)
+gunown_join <- dat_gun_ownership %>%
+  mutate(state_abbrev = to_abbrev(state)) %>%
+  filter(!is.na(state_abbrev)) %>%
+  transmute(
+    state = state_abbrev,
+    pct_households_gun_own_2022
+  )
+
+# Merge into dat_merged
+dat_merged <- dat_merged %>%
+  left_join(crime_join,  by = "state") %>%
+  left_join(trump_join,  by = "state") %>%
+  left_join(black_join,  by = "state") %>%
+  left_join(poverty_join,by = "state") %>%
+  left_join(gunown_join, by = "state")
+
+# Sanity checks
+# Any states in the survey not found in the context files?
+missing_any <- function(context_df) {
+  anti_join(dat_merged %>% distinct(state), context_df, by = "state")
+}
+missing_any(crime_join)    # expect 0 rows
+missing_any(trump_join)
+missing_any(black_join)
+missing_any(poverty_join)
+missing_any(gunown_join)
+
+# Look at new columns
+dplyr::glimpse(dat_merged %>% 
+                 dplyr::select(state, violent_rate_2024, trump_perc_2024, 
+                        pct_black_2020, pct_poverty_2024, pct_households_gun_own_2022) %>% 
+                 arrange(state))
+
+
+# z scored versions for modelling
+dat_merged <- dat_merged %>%
+  mutate(
+    state_violent_rate_2024_z = scale(violent_rate_2024)[,1],
+    state_trump_perc_2024_z = scale(trump_perc_2024)[,1],
+    state_pct_black_2020_z = scale(pct_black_2020)[,1],
+    state_pct_poverty_2024_z = scale(pct_poverty_2024)[,1],
+    state_gun_own_2022_z = scale(pct_households_gun_own_2022)[,1]
+  )
+```
+
+```{r Clean and recode other columns}
+# race
+sum(is.na(dat_merged$Q5))
+sum(is.na(dat_merged$Q4))
+# no missing race data
+
+# recode race variable, despite Alexandra's prior coding, which currently leaves lots of missing race data
+dat_merged <- dat_merged %>%
+  mutate(
+    # Hispanic overrides race for dummy coding
+    hisp = if_else(Q4 == 1, 1, 0),
+
+    # Non-Hispanic White
+    white = case_when(
+      hisp == 0 & Q5 == 1 ~ 1,
+      hisp == 0 & !is.na(Q5) ~ 0,
+      TRUE ~ 0  # if Q5 missing or hisp==1, set to 0
+    ),
+
+    # Non-Hispanic Black
+    black = case_when(
+      hisp == 0 & Q5 == 2 ~ 1,
+      hisp == 0 & !is.na(Q5) ~ 0,
+      TRUE ~ 0
+    ),
+
+    # Other race (non-Hispanic)
+    other_race = case_when(
+      hisp == 0 & Q5 %in% c(3,4,5,6) ~ 1,
+      hisp == 0 & !is.na(Q5) ~ 0,
+      TRUE ~ 0
+    )
+  )
+
+# recode gender
+table(dat_merged$female)
+
+# recode income (originally coded during weighting process. Got from Lucid. Different from our question in the survey)
+dat_merged <- dat_merged %>% 
+  mutate(
+    income_cat = case_when(
+      inc5_cat == 1 ~ "<30",
+      inc5_cat == 2 ~ "30-59",
+      inc5_cat == 3 ~ "60-99",
+      inc5_cat == 4 ~ "100-149",
+      inc5_cat == 5 ~ "150+",
+      TRUE ~ NA_character_
+    ) %>% 
+      factor(levels = c("<30", "30-59", "60-99", "100-149", "150+"))
+  )
+
+# Create dummy variables
+dat_merged <- dat_merged %>% 
+  mutate(
+    income_30_less   = ifelse(income_cat == "<30", 1, 0),
+    income_30_59     = ifelse(income_cat == "30-59", 1, 0),
+    income_60_99     = ifelse(income_cat == "60-99", 1, 0),
+    income_100_149   = ifelse(income_cat == "100-149", 1, 0),
+    income_150_plus  = ifelse(income_cat == "150+", 1, 0)
+  )
+  
+# recode veteran (Q84)
+dat_merged <- dat_merged %>% 
+  mutate(veteran = case_when(
+    Q84 == 1 ~ 0,
+    Q84 == 2 ~ 1,
+    Q84 == 3 ~ 0,
+    TRUE ~ NA_real_
+  ))
+
+# recode active duty (Q84)
+dat_merged <- dat_merged %>% 
+  mutate(active_milit = case_when(
+    Q84 == 1 ~ 1,
+    Q84 == 2 ~ 0,
+    Q84 == 3 ~ 0,
+    TRUE ~ NA_real_
+  ))
+
+# recode law_enforcement (Q85)
+dat_merged <- dat_merged %>% 
+  mutate(law_enforcement = case_when(
+    Q85 == 1 ~ 1,
+    Q85 == 2 ~ 1,
+    Q85 == 3 ~ 0,
+    TRUE ~ NA_real_
+  ))
+
+# recode days carried outside the home
+dat_merged <- dat_merged %>% 
+  mutate(days_carried = Q81 - 1)
+# we'll definitely want to test these removing the extremes as well
+# remove options for 30 days and 0 days
+dat_merged <- dat_merged %>% 
+  mutate(days_carried_no_high = ifelse(days_carried < 30, days_carried, NA),
+         days_carried_no_extremes = ifelse(days_carried > 0 & days_carried < 30, days_carried, NA))
+
+# oh also a dichotomous variable for whether you carried a gun in the last 30 days or not
+dat_merged <- dat_merged %>% 
+  mutate(carried_past_thirty_binary = case_when(
+    days_carried == 0 ~ 0,
+    days_carried > 0 ~ 1,
+    TRUE ~ NA_real_
+    ))
+
+# make days_carried variable with 0 when they said they never carried in previous question
+dat_merged <- dat_merged %>% 
+  mutate(days_carried_include_nevers = case_when(
+    !is.na(days_carried) ~ days_carried,
+    Q80 == 1 ~ 0,
+    TRUE ~ NA_real_)
+  )
+
+# code new carry frequency variable
+dat_merged <- dat_merged %>%
+  mutate(
+    carry_freq = case_when(
+      days_carried_include_nevers == 0 ~ 0,
+      days_carried_include_nevers >= 1 & days_carried_include_nevers <= 14 ~ 1,
+      days_carried_include_nevers >= 15 ~ 2,
+      TRUE ~ NA_real_
+    )
+  )
+
+table(dat_merged$carry_freq, useNA = "ifany")
+
+dat_merged <- dat_merged %>%
+  mutate(
+    carry_freq_ord = factor(
+      carry_freq,
+      levels = c(0, 1, 2),
+      labels = c("0 Days", "1-14 Days", "15-30 Days"),
+      ordered = TRUE
+    )
+  )
+
+table(dat_merged$carry_freq_ord, useNA = "ifany")
+
+
+# make categorical carry_freq
+dat_merged <- dat_merged %>%
+  mutate(
+    carry_freq_cat = factor(
+      as.character(carry_freq_ord),
+      levels = c("0 Days", "1-14 Days", "15-30 Days")  # specify order
+    )
+  )
+str(dat_merged$carry_freq_cat)
+table(dat_merged$carry_freq_cat)
+
+# plan to purchase
+sum(is.na(dat_merged$Q82))
+dat_merged <- dat_merged %>% 
+  mutate(purchase_plan = case_when(
+    Q82 == 1 ~ 1,
+    Q82 == 2 ~ 0,
+    TRUE ~ NA_real_
+  ))
+
+# whether they have guns at home
+dat_merged <- dat_merged %>% 
+  mutate(gun_home = case_when(
+    Q78 == 1 ~ 1,
+    Q78 == 2 ~ 0,
+    Q78 == 3 ~ 0,
+    TRUE ~ NA_real_
+  ))
+
+dat_merged <- dat_merged %>% 
+  mutate(gun_own = case_when(
+    Q79 == 1 ~ 1,
+    Q78 == 2 ~ 0, # including these so that if they said no guns in their home, it also means they don't own a gun. otherwise this variable would be *among people with guns in their home, do they own it*
+    Q78 == 3 ~ 0,
+    Q79 == 2 ~ 0,
+    Q79 == 3 ~ 0,
+    TRUE ~ NA_real_
+  ))
+
+# Fill in carry type variables from Q80 only where they are currently missing
+# (so we don't overwrite manually coded values from open-ended responses)
+dat_merged <- dat_merged %>%
+  mutate(
+    concealed_carry = case_when(
+      is.na(concealed_carry) & Q80 == 2 ~ 1,   # Concealed carry
+      is.na(concealed_carry) & Q80 %in% c(1, 3) ~ 0,
+      TRUE ~ concealed_carry  # Keep existing manual codes
+    ),
+    open_carry = case_when(
+      is.na(open_carry) & Q80 == 3 ~ 1,        # Open carry
+      is.na(open_carry) & Q80 %in% c(1, 2) ~ 0,
+      TRUE ~ open_carry
+    ),
+    no_carry = case_when(
+      is.na(no_carry) & Q80 == 1 ~ 1,          # Does not carry
+      is.na(no_carry) & Q80 %in% c(2, 3) ~ 0,
+      TRUE ~ no_carry
+    )
+  )
+
+# Create a collapsed binary carry variable
+# 1 = carries (either concealed or open), 0 = has guns but does not carry outside home
+dat_merged <- dat_merged %>%
+  mutate(
+    carry = case_when(
+      open_carry == 1 | concealed_carry == 1 ~ 1,
+      no_carry == 1 ~ 0, # has guns (not NA) but doesn't carry outside the home
+      TRUE ~ NA_real_
+    )
+  )
+
+# Create mutually exclusive carry type categorical
+dat_merged <- dat_merged %>%
+  mutate(
+    carry_type_cat = case_when(
+      open_carry == 1 ~ "Open carry",            # Highest priority
+      concealed_carry == 1 ~ "Concealed carry",  # Second priority
+      no_carry == 1 ~ "No carry",                # Lowest priority
+      TRUE ~ NA_character_                       # Shouldn't happen, but protects integrity
+    ) %>%
+      factor(
+        levels = c("No carry", "Concealed carry", "Open carry")
+      )
+  )
+
+table(dat_merged$open_carry)
+sum(is.na(dat_merged$open_carry))
+table(dat_merged$concealed_carry)
+sum(is.na(dat_merged$concealed_carry))
+table(dat_merged$no_carry)
+sum(is.na(dat_merged$no_carry))
+nrow(dat_merged)
+
+####  Create mutually exclusive carry type categorical ####
+# Clean Q83 multiple-select: replace NAs with 0
+dat_merged <- dat_merged %>%
+  mutate(across(c(Q83_1, Q83_2, Q83_3, Q83_4, Q83_5),
+                ~ tidyr::replace_na(., 0)))
+
+# Create mutually exclusive firearm categories
+dat_merged <- dat_merged %>%
+  mutate(
+    handgun = as.integer(Q83_1 == 1 | Q83_2 == 1),
+    longgun = as.integer(Q83_3 == 1 | Q83_4 == 1 | Q83_5 == 1),
+    gun_type_cat = case_when(
+      handgun == 1 & longgun == 0 ~ "Handgun only",
+      handgun == 0 & longgun == 1 ~ "Long gun only",
+      handgun == 1 & longgun == 1 ~ "Mixed",
+      TRUE                       ~ "None"
+    )
+  )
+
+# Coerce to factor
+dat_merged <- dat_merged %>%
+  mutate(
+    gun_type_cat = factor(
+      gun_type_cat,
+      levels = c("None",
+                 "Handgun only",
+                 "Long gun only",
+                 "Mixed")
+    )
+  )
+
+```
+
+```{r Make variables for state permisiveness | Permit & Training Requirements}
+
+# state permit and training requirements gathered from Eveytown website: https://maps.everytownresearch.org/navigator/states.html?dataset=permitting_process&states=NY#q-gunmath_concealed_permit_required
+
+#### Permit Requirement ####
+
+state_permissive <- read_csv("data/Everytown_CC_permissive states.csv")
+
+state_permissive %>% 
+  pull(state) %>% 
+  n_distinct()
+
+dat_merged %>% 
+  pull(state) %>% 
+  n_distinct()
+
+# # which states are in dat_merged but not in state_permissive
+# setdiff(unique(dat_merged$state), unique(state_permissive$state))
+# # puerto rico is in dat_merged. Probably just have to put those as NA or cut from dataset
+
+# dat_merged %>% 
+#   filter(state == "PR") %>% 
+#   nrow()
+# # ah. okay it's one person. Sorry, bye puerto rico
+# # putting code up front to remove people from PR
+# cut PR in manual zipcode coding
+
+
+table(state_permissive$response)
+table(is.na(state_permissive$response))
+
+# see states that don't require permits for CC
+state_permissive %>% 
+  filter(response == "No") %>% 
+  pull(state)
+
+# create vector directly from the table
+concealed_permissive_states <- state_permissive %>%
+  filter(response == "No") %>%
+  pull(state)
+
+# use it in the dataset
+dat_merged <- dat_merged %>%
+  mutate(cc_no_permit = if_else(
+    state %in% concealed_permissive_states, 1, 0
+  ))
+
+
+
+dat_merged %>% 
+  filter(cc_no_permit == 1) %>% 
+  nrow()
+dat_merged %>% 
+  filter(cc_no_permit == 0) %>% 
+  nrow()
+# pretty balanced in terms of rows in permissive vs. permit states
+
+#### Training Requirement ####
+
+# get data for states that require training for cc
+
+state_training <- read_csv("data/Everytown_CC_training.csv")
+
+state_training %>% 
+  pull(state) %>% 
+  n_distinct()
+
+dat_merged %>% 
+  pull(state) %>% 
+  n_distinct()
+
+table(state_training$response)
+table(is.na(state_training$response))
+
+# see states that don't require training for CC
+state_training %>% 
+  filter(response == "No") %>% 
+  pull(state)
+
+# create vector directly from the table
+concealed_permissive_states <- state_training %>%
+  filter(response == "No") %>%
+  pull(state)
+
+# use it in the dataset
+dat_merged <- dat_merged %>%
+  mutate(cc_no_training = if_else(
+    state %in% concealed_permissive_states, 1, 0
+  ))
+
+
+
+table(dat_merged$cc_no_permit, dat_merged$cc_no_training)
+
+
+# make binary for permissive vs. restrictive
+dat_merged <- dat_merged %>%
+  mutate(state_permissiveness_01 = case_when(
+    cc_no_permit == 0 & cc_no_training == 0 ~ 0,
+    cc_no_permit == 1 & cc_no_training == 1 ~ 1,
+    TRUE ~ NA_real_
+  ))
+
+# make continuous/ordinal permissiveness variable
+dat_merged <- dat_merged %>%
+  mutate(state_permissiveness_con = case_when(
+    cc_no_permit == 0 & cc_no_training == 0 ~ 0,
+    cc_no_permit == 0 & cc_no_training == 1 ~ .5,
+    cc_no_permit == 1 & cc_no_training == 1 ~ 1,
+    TRUE ~ NA_real_
+  ))
+
+```
+
+```{r Identify states with low N}
+# Note: resolve_state_name() is defined in Utility functions chunk
+
+# Desired order for categories
+lvl <- c("A lot (100+)",
+         "Some (50–99)",
+         "Few (20–49)",
+         "Very few (<20)")
+
+# Counts & categories
+counts_all <- dat_merged %>%
+  filter(!is.na(state)) %>%
+  mutate(state_full = resolve_state_name(state)) %>%
+  filter(!is.na(state_full)) %>%
+  count(state_full, name = "n_all") %>%
+  mutate(category_all = case_when(
+    n_all < 20  ~ "Very few (<20)",
+    n_all < 50  ~ "Few (20–49)",
+    n_all < 100 ~ "Some (50–99)",
+    TRUE        ~ "A lot (100+)"
+  )) %>%
+  mutate(category_all = factor(category_all, levels = lvl))
+
+counts_gun <- dat_merged %>%
+  filter(!is.na(state), Q79 == 1) %>%
+  mutate(state_full = resolve_state_name(state)) %>%
+  filter(!is.na(state_full)) %>%
+  count(state_full, name = "n_gun") %>%
+  mutate(category_gun = case_when(
+    n_gun < 20  ~ "Very few (<20)",
+    n_gun < 50  ~ "Few (20–49)",
+    n_gun < 100 ~ "Some (50–99)",
+    TRUE        ~ "A lot (100+)"
+  )) %>%
+  mutate(category_gun = factor(category_gun, levels = lvl))
+
+# Add abbrevs for usmap (needed for later map plotting)
+counts_all <- counts_all %>%
+  mutate(state = state.abb[match(state_full, state.name)])
+counts_gun <- counts_gun %>%
+  mutate(state = state.abb[match(state_full, state.name)])
+
+# see states with the smallest N
+# states with smallest total sample size
+counts_all %>%
+  arrange(n_all) %>%
+  dplyr::select(state_full, n_all, category_all) %>%
+  slice_head(n = 10)
+
+# states with smallest gun-owner sample size
+counts_gun %>%
+  arrange(n_gun) %>%
+  dplyr::select(state_full, n_gun, category_gun) %>%
+  slice_head(n = 20)
+
+# see what we'd be losing if we dropped the very few states
+# States to drop
+drop_states <- counts_gun %>%
+  filter(category_gun == "Very few (<20)") %>%
+  pull(state_full)
+
+# convert full names -> abbreviations
+drop_states_abbr <- state.abb[match(drop_states, state.name)]
+drop_states_abbr
+
+# before dropping
+table_before_permit <- dat_merged %>%
+  distinct(state, cc_no_permit) %>%
+  count(cc_no_permit, name = "states_before")
+
+table_before_training <- dat_merged %>%
+  distinct(state, cc_no_training) %>%
+  count(cc_no_training, name = "states_before")
+
+# after dropping "very few" states
+table_after_permit <- dat_merged %>%
+  filter(!state %in% drop_states_abbr) %>%
+  distinct(state, cc_no_permit) %>%
+  count(cc_no_permit, name = "states_after")
+
+table_after_training <- dat_merged %>%
+  filter(!state %in% drop_states_abbr) %>%
+  distinct(state, cc_no_training) %>%
+  count(cc_no_training, name = "states_after")
+
+# merge before/after for each variable
+full_join(table_before_permit, table_after_permit, by = "cc_no_permit") %>%
+  arrange(cc_no_permit)
+
+full_join(table_before_training, table_after_training, by = "cc_no_training") %>%
+  arrange(cc_no_training)
+```
+
+```{r Display missingness of each relevant variable}
+# Define all variables of interest
+controls <- c(
+  "age1829", "age3044", "age4564", "female", "hisp", "other_race", "black",
+  "college", "gop", "ind", "notreligious", "otherreligion", "ideology",
+  "veteran", "active_milit", "law_enforcement", "worrycrime", "victimcrime",
+  "income_30_less", "income_60_99", "income_100_149", "income_150_plus", "econ"
+)
+
+state_vars <- c(
+  "state_violent_rate_2024_z", "state_pct_poverty_2024_z",
+  "state_pct_black_2020_z", "state_trump_perc_2024_z", "state_gun_own_2022_z"
+)
+
+predictors <- c("state", "cc_no_training", "cc_no_permit")
+gun_owner_dvs <- c("carry", "open_carry", "carry_freq_ord")
+all_dvs <- c("gun_own", "gun_home", "purchase_plan", "gun_type_cat")
+
+all_vars <- unique(c(predictors, controls, state_vars, gun_owner_dvs, all_dvs))
+
+# Compute NA counts and percentages
+na_summary <- dat_merged %>%
+  summarise(across(all_of(all_vars),
+                   list(
+                     missing_n = ~sum(is.na(.)),
+                     missing_pct = ~mean(is.na(.)) * 100
+                   ),
+                   .names = "{.col}_{.fn}")) %>%
+  pivot_longer(everything(),
+               names_to = c("variable", ".value"),
+               names_pattern = "(.*)_(missing_.*)") %>%
+  arrange(desc(missing_pct))
+
+# Display
+print(na_summary, n = nrow(na_summary))
+```
+
+```{r Recode Demographics for Descriptives Tables}
+
+dat_merged <- dat_merged %>% 
+  mutate(gender_char = case_when(
+    female == 0 ~ "Male",
+    female == 1 ~ "Female",
+    TRUE ~ NA_character_
+  ))
+
+dat_merged <- dat_merged %>% 
+  mutate(race_char = case_when(
+    white == 1 ~ "White",
+    black == 1 ~ "Black",
+    hisp == 1 ~ "Hispanic",
+    other_race == 1 ~ "Other",
+    TRUE ~ NA_character_
+  ))
+
+dat_merged <- dat_merged %>% 
+  mutate(age_group_char = case_when(
+    age1829 == 1 ~ "18-29",
+    age3044 == 1 ~ "30-44",
+    age4564 == 1 ~ "45-64",
+    age65p == 1 ~ "65+",
+    TRUE ~ NA_character_
+  ))
+
+dat_merged <- dat_merged %>% 
+  mutate(religion_char = case_when(
+    christian == 1 ~ "Christian (any denomination)",
+    otherreligion == 1 ~ "Other Religion",
+    notreligious == 1 ~ "Non-Religious",
+    TRUE ~ NA_character_
+  ))
+
+dat_merged <- dat_merged %>% 
+  mutate(college_char = case_when(
+    college == 1 ~ "College-Educated",
+    college == 0 ~ "Non-College",
+    TRUE ~ NA_character_
+  ))
+
+dat_merged <- dat_merged %>% 
+  mutate(party_char = case_when(
+    gop == 1 ~ "Republican",
+    ind == 1 ~ "Independent",
+    dem == 1 ~ "Democrat",
+    TRUE ~ NA_character_
+  ))
+
+# Income - already coded, but just called "_cat"
+dat_merged <- dat_merged %>%
+  mutate(
+    income_char = factor(
+      income_cat,
+      levels = c("<30", "30-59", "60-99", "100-149", "150+")
+    )
+  )
+
+# Income - already coded, but just called "_cat"
+dat_merged <- dat_merged %>%
+  mutate(
+    income_char = case_when(
+      income_cat == "<30" ~ "< $30,000",
+      income_cat == "30-59" ~ "$30,000-59,000",
+      income_cat == "60-99" ~ "$60,000-99,000",
+      income_cat == "100-149" ~ "$100,000-149,000",
+      income_cat == "150+" ~ "$150,000 +",
+    TRUE ~ NA_character_
+    ))
+      
+
+# veteran + active_milit + law_enforcement
+dat_merged <- dat_merged %>% 
+  mutate(veteran_char = case_when(
+    veteran == 0 ~ "No",
+    veteran == 1 ~ "Yes",
+    TRUE ~ NA_character_
+  ),
+  law_enforcement_char = case_when(
+    law_enforcement == 0 ~ "No",
+    law_enforcement == 1 ~ "Yes",
+    TRUE ~ NA_character_
+  ),
+  active_milit_char = case_when(
+    active_milit == 0 ~ "No",
+    active_milit == 1 ~ "Yes",
+    TRUE ~ NA_character_
+  ),)
+
+
+dat_merged <- dat_merged %>% 
+  mutate(permit_req_char = case_when(
+    cc_no_permit == 0 ~ "Permit Required",
+    cc_no_permit == 1 ~ "No Permit Required",
+    TRUE ~ NA_character_
+  ))
+
+dat_merged <- dat_merged %>% 
+  mutate(training_req_char = case_when(
+    cc_no_training == 0 ~ "Training Required",
+    cc_no_training == 1 ~ "No Training Required",
+    TRUE ~ NA_character_
+  ))
+
+
+#### Order the levels of character demographic variables ####
+
+dat_merged <- dat_merged %>%
+  mutate(
+    gender_char = factor(gender_char,
+      levels = c("Male", "Female")
+    ),
+    
+    race_char = factor(race_char,
+      levels = c("White", "Black", "Hispanic", "Other")
+    ),
+    
+    age_group_char = factor(age_group_char,
+      levels = c("18-29", "30-44", "45-64", "65+")
+    ),
+    
+    religion_char = factor(religion_char,
+      levels = c("Christian (any denomination)",
+                 "Other Religion",
+                 "Non-Religious")
+    ),
+    
+    college_char = factor(college_char,
+      levels = c("Non-College", "College-Educated")
+    ),
+    
+    income_char = factor(income_char,
+      levels = c(
+        "< $30,000",
+        "$30,000-59,000",
+        "$60,000-99,000",
+        "$100,000-149,000",
+        "$150,000 +"
+      )
+    ),
+    
+    party_char = factor(party_char,
+      levels = c("Democrat", "Independent", "Republican")
+    ),
+    
+    veteran_char = factor(veteran_char,
+      levels = c("No", "Yes")
+    ),
+    
+    law_enforcement_char = factor(law_enforcement_char,
+      levels = c("No", "Yes")
+    ),
+    
+    active_milit_char = factor(active_milit_char,
+      levels = c("No", "Yes")
+    ),
+    
+    permit_req_char = factor(permit_req_char,
+      levels = c("Permit Required", "No Permit Required")
+    ),
+    
+    training_req_char = factor(training_req_char,
+      levels = c("Training Required", "No Training Required")
+    )
+  )
+```
+
+Relevant controls:
+age1829 + age3044 + age65p + female + hisp + black + other_race + college + income_30_59 + income_60_99 + income_100_149 + income_150_plus + gop + ind + notreligious + otherreligion + ideology + income + veteran + active_milit + law_enforcement + victimcrime + worrycrime + econ
+
+reference categories are the largest group of any demographic:
+reference race = white
+reference gender = male
+reference religion = christian
+reference pid = dem
+reference age = age4564
+reference income = income_30_less
+
+Making single master datasets that can be used in each DV universe. We make a gun-owners dataset, and all dataset, and a no small N states gun-owners dataset and a no small n states all dataset. Each uses list-wise deletion for rows missing any key or control variables.
+
+*Primary DVs for gun-owners:*
+- carry
+- open_carry
+- carry_freq_cat
+- carry_type_cat
+
+*Primary DVs for all:*
+- gun_own
+- gun_home
+- purchase_plan
+- gun_type_cat
+
+```{r Make processed datasets for analysis}
+
+controls <- c(
+  "age1829", "age3044", "age65p", "female", "hisp", "other_race", "black",
+  "college", "gop", "ind", "notreligious", "otherreligion", "ideology",
+  "veteran", "active_milit", "law_enforcement", "victimcrime", "worrycrime",
+  "income_30_less", "income_60_99", "income_100_149", "income_150_plus",
+  "econ", "state_violent_rate_2024_z", "state_pct_poverty_2024_z", 
+  "state_pct_black_2020_z", "state_trump_perc_2024_z", "state_gun_own_2022_z"
+)
+
+# key DVs
+key_vars_all   <- c("state", "cc_no_training", "cc_no_permit", controls)
+key_vars_owners <- c("state", "cc_no_training", "cc_no_permit", controls)
+
+# --- Gun-owner DVs ---
+owner_dvs <- c("carry", "open_carry", "carry_freq_ord")
+
+# --- All-sample DVs ---
+all_dvs <- c("gun_own", "gun_home", "purchase_plan", "gun_type_cat")
+
+#### Function: listwise delete on controls (optionally on DVs) ####
+make_processed <- function(data,
+                           dvs,
+                           key_vars,
+                           drop_dvs = TRUE) {
+  # Base vars we always require to be non-missing
+  base_vars <- key_vars
+  
+  # Optionally also require DVs to be non-missing
+  all_vars <- if (drop_dvs) {
+    unique(c(base_vars, dvs))
+  } else {
+    base_vars
+  }
+  
+  data %>%
+    dplyr::filter(
+      dplyr::if_all(
+        dplyr::all_of(all_vars),
+        ~ !is.na(.x)
+      )
+    )
+}
+
+#### Make each dataset ####
+
+# All respondents for all-sample DVs
+dat_all_processed <- make_processed(
+  data     = dat_merged,
+  dvs      = all_dvs,
+  key_vars = key_vars_all,
+  drop_dvs = TRUE     # here we *do* want listwise deletion incl. DVs
+)
+
+# Gun owners only, for owner DVs
+dat_gunowners_processed <- dat_merged %>%
+  dplyr::filter(gun_own == 1) %>%
+  make_processed(
+    dvs      = owner_dvs,
+    key_vars = key_vars_owners,
+    drop_dvs = TRUE     # keep requiring non-missing owner DVs
+  )
+
+# Non-gun-owners: only clean on controls, ignore owner DVs (which are NA)
+dat_NONgunowners_processed <- dat_merged %>%
+  dplyr::filter(gun_own == 0) %>%
+  make_processed(
+    dvs      = owner_dvs,
+    key_vars = key_vars_owners,
+    drop_dvs = FALSE    # do *not* drop on owner DVs
+  )
+
+#### Exclude small-N states ####
+
+dat_all_processed_nomin <- dat_all_processed %>%
+  dplyr::filter(!(state %in% drop_states_abbr))
+
+dat_gunowners_processed_nomin <- dat_gunowners_processed %>%
+  dplyr::filter(!(state %in% drop_states_abbr))
+
+dat_NONgunowners_processed_nomin <- dat_NONgunowners_processed %>%
+  dplyr::filter(!(state %in% drop_states_abbr))
+```
+
+dat_all_processed
+dat_all_processed_nomin
+dat_gunowners_processed
+dat_gunowners_processed_nomin
+
+```{r Make maps with final dataframe}
+# order
+lvl <- c("A lot (100+)",
+         "Some (50–99)",
+         "Few (20–49)",
+         "Very few (<20)")
+
+# Counts & categories
+counts_all <- dat_all_processed %>%
+  filter(!is.na(state)) %>%
+  mutate(state_full = resolve_state_name(state)) %>%
+  filter(!is.na(state_full)) %>%
+  count(state_full, name = "n_all") %>%
+  mutate(category_all = case_when(
+    n_all < 20  ~ "Very few (<20)",
+    n_all < 50  ~ "Few (20–49)",
+    n_all < 100 ~ "Some (50–99)",
+    TRUE        ~ "A lot (100+)"
+  )) %>%
+  mutate(category_all = factor(category_all, levels = lvl))
+
+counts_gun <- dat_gunowners_processed %>%
+  filter(!is.na(state), Q79 == 1) %>%
+  mutate(state_full = resolve_state_name(state)) %>%
+  filter(!is.na(state_full)) %>%
+  count(state_full, name = "n_gun") %>%
+  mutate(category_gun = case_when(
+    n_gun < 20  ~ "Very few (<20)",
+    n_gun < 50  ~ "Few (20–49)",
+    n_gun < 100 ~ "Some (50–99)",
+    TRUE        ~ "A lot (100+)"
+  )) %>%
+  mutate(category_gun = factor(category_gun, levels = lvl))
+
+# Add abbrevs for usmap
+counts_all <- counts_all %>%
+  mutate(state = state.abb[match(state_full, state.name)])
+counts_gun <- counts_gun %>%
+  mutate(state = state.abb[match(state_full, state.name)])
+
+# Palette
+pal <- c(
+  "Very few (<20)" = "#f2f0f7",
+  "Few (20–49)"    = "#cbc9e2",
+  "Some (50–99)"   = "#9e9ac8",
+  "A lot (100+)"   = "#6a51a3"
+)
+
+# Plots
+p_all <- plot_usmap(data = counts_all,
+                    values = "category_all",
+                    regions = "states") +
+  scale_fill_manual(values = pal,
+                    breaks = lvl,          # enforce order
+                    drop = FALSE,          # keep all categories if unused
+                    na.value = "grey90",
+                    na.translate = FALSE,  # hide NA from legend
+                    name = "Respondents per state") +
+  labs(title = " ") +
+  theme(legend.position = "bottom")
+
+p_gun <- plot_usmap(data = counts_gun,
+                    values = "category_gun",
+                    regions = "states") +
+  scale_fill_manual(values = pal,
+                    breaks = lvl,
+                    drop = FALSE,
+                    na.value = "grey90",
+                    na.translate = FALSE,
+                    name = "Gun owners per state") +
+  labs(title = " ") +
+  theme(legend.position = "bottom")
+
+p_all
+p_gun
+
+# Save
+ggsave("output/figures/map_all_respondents.png", p_all, width = 8, height = 5, dpi = 300)
+ggsave("output/figures/map_gun_owners.png",    p_gun, width = 8, height = 5, dpi = 300)
+
+# see states with the smallest N
+counts_all %>%
+  arrange(n_all) %>%
+  dplyr::select(state_full, n_all, category_all) %>%
+  slice_head(n = 10)
+
+```
+
+```{r See missing data in original dat_merged dataset}
+
+# Variables used in all models
+
+vars_used <- c(
+  # main predictor
+  "state_permissiveness_con", "cc_no_permit", "cc_no_training",
+
+  # individual-level controls
+  "age1829", "age3044", "age65p", "female",
+  "hisp", "other_race", "black", "college",
+  "income_30_less",
+  "income_30_59", "income_60_99",
+  "income_100_149", "income_150_plus",
+  "gop", "ind", "notreligious", "otherreligion",
+  "ideology", "veteran", "active_milit",
+  "law_enforcement", "worrycrime", "victimcrime",
+
+  # state controls
+  "state_violent_rate_2024_z",
+  "state_pct_poverty_2024_z",
+  "state_pct_black_2020_z",
+  "state_trump_perc_2024_z",
+  "state_gun_own_2022_z",
+
+  # random intercept variable
+  "state",
+  
+  # DVs
+ "gun_home","gun_own","purchase_plan", "gun_type_cat"
+)
+
+# If you're running this for a specific DV, add it:
+# vars_used <- c("purchase_plan", vars_used)
+
+# Count NAs in these variables
+
+na_summary <- dat_merged %>%
+  dplyr::select(all_of(vars_used)) %>%
+  summarise(across(everything(), ~ sum(is.na(.)), .names = "missing_{col}")) %>%
+  pivot_longer(everything(),
+               names_to   = "variable",
+               values_to  = "n_missing") %>%
+  mutate(variable = str_replace(variable, "^missing_", "")) %>%
+  arrange(desc(n_missing))
+
+print(na_summary, n = nrow(na_summary))
+
+
+
+table(dat_merged$Q5)
+sum(is.na(dat_merged$Q5))
+sum(is.na(dat_merged$Q4))
+
+# Build the table
+missing_table <- na_summary %>%
+  mutate(
+    pct_missing = round(n_missing / nrow(dat_merged) * 100, 2),
+    variable = case_match(variable,
+      "veteran" ~ "Veteran status",
+      "active_milit" ~ "Active military status",
+      "law_enforcement" ~ "Law enforcement status",
+      "victimcrime" ~ "Crime victimization",
+      "worrycrime" ~ "Worry about crime",
+      "gun_own" ~ "Gun ownership",
+      "state_gun_own_2022_z" ~ "State gun-ownership rate (z)",
+      "gun_home" ~ "Gun in home",
+      "purchase_plan" ~ "Purchase intention",
+      "state_permissiveness_con" ~ "State permissiveness (continuous)",
+      "cc_no_permit" ~ "No permit required",
+      "cc_no_training" ~ "No training required",
+      "age1829" ~ "Age 18–29",
+      "age3044" ~ "Age 30–44",
+      "age65p" ~ "Age 65+",
+      "female" ~ "Female",
+      "hisp" ~ "Hispanic",
+      "other_race" ~ "Other race",
+      "black" ~ "Black",
+      "college" ~ "College graduate",
+      "income_30_less" ~ "Income <$30,000",
+      "income_30_59" ~ "Income $30,000–$59,999",
+      "income_60_99" ~ "Income $60,000–$99,999",
+      "income_100_149" ~ "Income $100,000–$149,999",
+      "income_150_plus" ~ "Income $150,000+",
+      "gop" ~ "Republican",
+      "ind" ~ "Independent",
+      "notreligious" ~ "Not religious",
+      "otherreligion" ~ "Other religion",
+      "ideology" ~ "Ideology (conservatism)",
+      "state_violent_rate_2024_z" ~ "State violent crime rate (z)",
+      "state_pct_poverty_2024_z" ~ "State poverty rate (z)",
+      "state_pct_black_2020_z" ~ "State % Black (z)",
+      "state_trump_perc_2024_z" ~ "State Trump vote share (z)",
+      "state" ~ "State",
+      "gun_type_cat" ~ "Firearm type",
+      .default = variable
+    )
+  ) %>%
+  rename(
+    Variable = variable,
+    `N Missing` = n_missing,
+    `% Missing` = pct_missing
+  )
+
+# Create flextable
+ft <- flextable(missing_table) %>%
+  set_header_labels(Variable = "Variable", `N Missing` = "N Missing", `% Missing` = "% Missing") %>%
+  colformat_double(j = "% Missing", digits = 2) %>%
+  fontsize(size = 10, part = "all") %>%
+  font(fontname = "Times New Roman", part = "all") %>%
+  autofit() %>%
+  set_caption("Missing Data by Analytic Variable (N = 18,251)")
+
+# Export to Word
+doc <- read_docx() %>%
+  body_add_flextable(ft)
+print(doc, target = "output/missing_data_table.docx")
+
+```
+
+```{r Make table for missing data for original datasets}
+# Variable labels
+var_labels <- c(
+  "cc_no_permit" = "No permit required",
+  "age1829" = "Age 18\u201329", "age3044" = "Age 30\u201344", "age65p" = "Age 65+",
+  "female" = "Female", "hisp" = "Hispanic", "other_race" = "Other race",
+  "black" = "Black", "college" = "College graduate",
+  "income_30_less" = "Income <$30,000", "income_30_59" = "Income $30,000\u2013$59,999",
+  "income_60_99" = "Income $60,000\u2013$99,999", "income_100_149" = "Income $100,000\u2013$149,999",
+  "income_150_plus" = "Income $150,000+",
+  "gop" = "Republican", "ind" = "Independent",
+  "notreligious" = "Not religious", "otherreligion" = "Other religion",
+  "ideology" = "Ideology (conservatism)",
+  "veteran" = "Veteran status", "active_milit" = "Active military status",
+  "law_enforcement" = "Law enforcement status",
+  "worrycrime" = "Worry about crime", "victimcrime" = "Crime victimization",
+  "state_violent_rate_2024_z" = "State violent crime rate (z)",
+  "state_pct_poverty_2024_z" = "State poverty rate (z)",
+  "state_pct_black_2020_z" = "State % Black (z)",
+  "state_trump_perc_2024_z" = "State Trump vote share (z)",
+  "state_gun_own_2022_z" = "State gun-ownership rate (z)",
+  "state" = "State",
+  "gun_own" = "Gun ownership", "gun_home" = "Gun in home",
+  "purchase_plan" = "Purchase intention", "gun_type_cat" = "Firearm type",
+  "carry" = "Carry outside home", "open_carry" = "Open carry",
+  "carry_freq_cat" = "Carry frequency", "carry_type_cat" = "Carry type"
+)
+
+shared_vars <- c(
+  "cc_no_permit", "age1829", "age3044", "age65p", "female",
+  "hisp", "other_race", "black", "college",
+  "income_30_less", "income_30_59", "income_60_99",
+  "income_100_149", "income_150_plus",
+  "gop", "ind", "notreligious", "otherreligion",
+  "ideology", "veteran", "active_milit",
+  "law_enforcement", "worrycrime", "victimcrime",
+  "state_violent_rate_2024_z", "state_pct_poverty_2024_z",
+  "state_pct_black_2020_z", "state_trump_perc_2024_z",
+  "state_gun_own_2022_z", "state"
+)
+
+dvs_all <- c("gun_own", "gun_home", "purchase_plan", "gun_type_cat")
+dvs_go <- c("carry", "open_carry", "carry_freq_cat", "carry_type_cat")
+all_vars <- c(dvs_all, dvs_go, shared_vars)
+
+dat_go <- dat_merged %>% filter(gun_own == 1)
+n_all <- nrow(dat_merged)
+n_go <- nrow(dat_go)
+
+# Count missing in full sample (only vars that exist)
+vars_in_all <- intersect(all_vars, names(dat_merged))
+vars_in_go <- intersect(all_vars, names(dat_go))
+
+miss_all <- sapply(vars_in_all, function(v) sum(is.na(dat_merged[[v]])))
+miss_go <- sapply(vars_in_go, function(v) sum(is.na(dat_go[[v]])))
+
+# Build combined table
+combined <- tibble(variable = all_vars) %>%
+  mutate(
+    Variable = ifelse(variable %in% names(var_labels), var_labels[variable], variable),
+    n_miss_all = ifelse(variable %in% names(miss_all), miss_all[variable], NA_integer_),
+    n_miss_go  = ifelse(variable %in% names(miss_go), miss_go[variable], NA_integer_),
+    `Full Sample` = ifelse(
+      is.na(n_miss_all), "\u2014",
+      paste0(n_miss_all, " (", sprintf("%.1f", n_miss_all / n_all * 100), "%)")
+    ),
+    `Gun Owners` = ifelse(
+      is.na(n_miss_go), "\u2014",
+      paste0(n_miss_go, " (", sprintf("%.1f", n_miss_go / n_go * 100), "%)")
+    )
+  ) %>%
+  dplyr::select(Variable, `Full Sample`, `Gun Owners`)
+
+# Flextable
+ft <- flextable(combined) %>%
+  set_header_labels(
+    Variable = "Variable",
+    `Full Sample` = paste0("Full Sample\n(N = ", format(n_all, big.mark = ","), ")"),
+    `Gun Owners` = paste0("Gun Owners\n(N = ", format(n_go, big.mark = ","), ")")
+  ) %>%
+  align(j = 2:3, align = "center", part = "all") %>%
+  fontsize(size = 10, part = "all") %>%
+  font(fontname = "Times New Roman", part = "all") %>%
+  autofit() %>%
+  set_caption("Missing Data by Analytic Variable (N Missing / % of Sample)")
+
+doc <- read_docx() %>%
+  body_add_flextable(ft)
+print(doc, target = "output/missing_data_table.docx")
+```
+
+```{r See missing data in full processed dataset}
+# Variables used in all models
+
+vars_used <- c(
+  # main predictor
+  "state_permissiveness_con", "cc_no_permit", "cc_no_training",
+
+  # individual-level controls
+  "age1829", "age3044", "age65p", "female",
+  "hisp", "other_race", "black", "college",
+  "gop", "ind", "notreligious", "otherreligion",
+  "ideology", "veteran", "active_milit",
+  "law_enforcement", "worrycrime", "victimcrime",
+
+  # state controls
+  "state_violent_rate_2024_z",
+  "state_pct_poverty_2024_z",
+  "state_pct_black_2020_z",
+  "state_trump_perc_2024_z",
+  "state_gun_own_2022_z",
+
+  # random intercept variable
+  "state",
+  
+  # DVs
+ "gun_home","gun_own","purchase_plan", "gun_type_cat"
+)
+
+# If running this for a specific DV, add it:
+# vars_used <- c("purchase_plan", vars_used)
+
+# Count NAs in these variables
+
+na_summary <- dat_all_processed %>%
+  dplyr::select(all_of(vars_used)) %>%
+  summarise(across(everything(), ~ sum(is.na(.)), .names = "missing_{col}")) %>%
+  pivot_longer(everything(),
+               names_to   = "variable",
+               values_to  = "n_missing") %>%
+  mutate(variable = str_replace(variable, "^missing_", "")) %>%
+  arrange(desc(n_missing))
+
+print(na_summary, n = nrow(na_summary))
+```
+
+```{r See missing data in gun owners processed dataset}
+# Variables used in all models
+
+vars_used <- c(
+  # main predictors
+  "state_permissiveness_con", "cc_no_permit", "cc_no_training",
+
+  # individual-level controls
+  "age1829", "age3044", "age65p", "female",
+  "hisp", "other_race", "black", "college",
+  "gop", "ind", "notreligious", "otherreligion",
+  "ideology", "veteran", "active_milit",
+  "law_enforcement", "worrycrime", "victimcrime",
+
+  # state controls
+  "state_violent_rate_2024_z",
+  "state_pct_poverty_2024_z",
+  "state_pct_black_2020_z",
+  "state_trump_perc_2024_z",
+  "state_gun_own_2022_z",
+
+  # random intercept variable
+  "state",
+  
+  # DVs
+ "carry","open_carry", "carry_freq_ord"
+)
+
+# If running this for a specific DV, add it:
+# vars_used <- c("purchase_plan", vars_used)
+
+
+# Count NAs in these variables
+na_summary <- dat_gunowners_processed %>%
+  dplyr::select(all_of(vars_used)) %>%
+  summarise(across(everything(), ~ sum(is.na(.)), .names = "missing_{col}")) %>%
+  pivot_longer(everything(),
+               names_to   = "variable",
+               values_to  = "n_missing") %>%
+  mutate(variable = str_replace(variable, "^missing_", "")) %>%
+  arrange(desc(n_missing))
+
+print(na_summary, n = nrow(na_summary))
+```
+
+```{r Shared analysis specifications}
+#### Main IV ####
+main_iv <- "cc_no_permit"
+
+#### Control variables ####
+control_vars <- c(
+  "age1829", "age3044", "age65p", "female",
+  "hisp", "black", "other_race",
+  "college",
+  "income_30_59", "income_60_99",
+  "income_100_149", "income_150_plus",
+  "gop", "ind",
+  "notreligious", "otherreligion",
+  "ideology",
+  "veteran", "active_milit", "law_enforcement",
+  "worrycrime", "victimcrime",
+  "econ"
+)
+
+# Variant with gun ownership as additional control
+control_vars_gunown <- c("gun_own", control_vars)
+
+#### State covariate sets ####
+state_sets <- list(
+  set1 = "state_violent_rate_2024_z",
+  set2 = "state_pct_poverty_2024_z",
+  set3 = "state_pct_black_2020_z",
+  set4 = "state_trump_perc_2024_z",
+  set5 = "state_gun_own_2022_z"
+)
+
+#### Model titles ####
+model_titles <- c(
+  "Base",
+  "+ Ind Controls",
+  "+ Violent crime rate (state)",
+  "+ Poverty rate (state)",
+  "+ % Black (state)",
+  "+ Trump 2024 vote share (state)",
+  "+ Gun-ownership rate (state)"
+)
+
+#### Variable labels ####
+var_labels <- c(
+  "(Intercept)"                 = "Intercept",
+  "cc_no_permit"                = "No-permit state",
+  "age1829"                     = "Age 18–29",
+  "age3044"                     = "Age 30–44",
+  "age65p"                      = "Age 65+",
+  "female"                      = "Female",
+  "hisp"                        = "Hispanic",
+  "black"                       = "Black",
+  "other_race"                  = "Other race",
+  "college"                     = "College graduate",
+  "income_30_59"                = "Income ($30–59,999)",
+  "income_60_99"                = "Income ($60–99,999)",
+  "income_100_149"              = "Income ($100–149,999)",
+  "income_150_plus"             = "Income ($150,000+)",
+  "gop"                         = "Republican",
+  "ind"                         = "Independent",
+  "notreligious"                = "Not religious",
+  "otherreligion"               = "Other religion",
+  "ideology"                    = "Ideology (conservatism)",
+  "veteran"                     = "Veteran",
+  "active_milit"                = "Active duty",
+  "law_enforcement"             = "Law enforcement",
+  "worrycrime"                  = "Worried about crime",
+  "victimcrime"                 = "Crime victim",
+  "econ"                        = "Financial worry",
+  "state_violent_rate_2024_z"   = "Violent crime rate (z)",
+  "state_pct_poverty_2024_z"    = "Poverty % (z)",
+  "state_pct_black_2020_z"      = "% Black (z)",
+  "state_trump_perc_2024_z"     = "Trump vote % (z)",
+  "state_gun_own_2022_z"        = "Gun ownership % (z)"
+)
+
+# Variant with gun ownership label
+var_labels_gunown <- c(
+  var_labels[1:2],  # Intercept, cc_no_permit
+  "gun_own" = "Gun owner",
+  var_labels[3:length(var_labels)]
+)
+
+#### Variable ordering ####
+var_order <- c(
+  "cc_no_permit",
+  "age1829", "age3044", "age65p", "female",
+  "hisp", "black", "other_race",
+  "college",
+  "income_30_59", "income_60_99",
+  "income_100_149", "income_150_plus",
+  "gop", "ind",
+  "notreligious", "otherreligion",
+  "ideology",
+  "veteran", "active_milit", "law_enforcement",
+  "worrycrime", "victimcrime", "econ",
+  "state_violent_rate_2024_z",
+  "state_pct_poverty_2024_z",
+  "state_pct_black_2020_z",
+  "state_trump_perc_2024_z",
+  "state_gun_own_2022_z"
+)
+
+# Variant with gun ownership in order
+var_order_gunown <- c(
+  "cc_no_permit", "gun_own",
+  var_order[2:length(var_order)]
+)
+```
+
+```{r Remove large objects}
+rm(output)
+rm(results_list)
+rm(response)
+rm(hud_key)
+rm(hud_zipkey)
+rm(expected_from_flags)
+rm(p_all)
+rm(p_gun)
+rm(key)
+rm(table_after_permit)
+rm(table_after_training)
+rm(table_before_permit)
+rm(table_before_training)
+rm(poverty_join)
+rm(trump_join)
+rm(gunown_join)
+rm(crime_join)
+rm(black_join)
+rm(dat_black)
+rm(dat_crime)
+rm(dat_gun_ownership)
+rm(dat_poverty)
+rm(dat_trump)
+rm(model1)
+rm(m1)
+rm(mods)
+rm(m_unw)
+rm(m_wt)
+rm(ft)
+rm(assembled)
+
+```
+
+***Run everything above here***
+
+Specify multivariate regression models to test whether gun owners in permitless states are more likely to carry firearms outside the home, carry them concealed or open, and how frequently they carry outside the home, including clusters at the state level.
+
+***Descriptives***
+
+```{r Some descriptives for the report text}
+nrow(dat) - nrow(dat_all_processed)
+
+prop.table(table(dat_gunowners_processed$carry_type_cat, useNA = "ifany"))*100
+
+table(dat_gunowners_processed$Q80)
+
+dat_gunowners_processed %>% 
+  dplyr::count(Q80, prop = TRUE, drop = FALSE)
+
+prop.table(table(dat_gunowners_processed$Q80, useNA = "ifany"))*100
+
+table(dat_gunowners_processed$Q80_4_TEXT)
+
+dat_gunowners_processed %>%
+  count(Q80) %>% 
+  mutate(pct = round(n / sum(n) *100,1))
+
+dat_orig <- read_csv("data/data_weighted_stata.csv")
+dat_orig %>%
+  mutate(Q80_orig = ifelse(!is.na(Q80_4_TEXT), 4, Q80)) %>%
+  mutate(Q80_orig = as.numeric(Q80_orig)) %>% 
+  count(Q80_orig) %>% 
+  mutate(pct = n / sum(n) *100)
+rm(dat_orig)
+
+```
+
+Figure for days carried
+```{r Histogram | Days Carried (Including Nevers)}
+ggplot(dat_gunowners_processed,
+       aes(x = days_carried_include_nevers)) +
+  geom_histogram(
+    binwidth = 1,
+    color = "white",
+    fill = "steelblue"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 30, 5)   # no limits → keeps all observations
+  ) +
+  labs(
+    x = "Days carried (0–30)",
+    y = "Count of respondents"
+  ) +
+  theme_classic(base_size = 14, base_family = "Times New Roman") +
+  theme(
+    panel.grid = element_blank(),
+    text = element_text(family = "Times New Roman")
+  )
+
+table(dat_gunowners_processed$days_carried_include_nevers, useNA = "ifany")
+```
+
+Demographics Mega-Table
+
+```{r Demographics | Master Table}
+#### Demographic variables ####
+demos <- c(
+  "gender_char","race_char","age_group_char","religion_char",
+  "college_char","income_char","party_char",
+  "veteran_char","law_enforcement_char","active_milit_char",
+  "permit_req_char","training_req_char"
+)
+
+#### Human-readable titles ####
+demo_titles <- c(
+  gender_char          = "Gender",
+  race_char            = "Race/ethnicity",
+  age_group_char       = "Age group",
+  religion_char        = "Religion",
+  college_char         = "Education",
+  income_char          = "Income",
+  party_char           = "Party ID",
+  veteran_char         = "Veteran status",
+  law_enforcement_char = "Law enforcement status",
+  active_milit_char    = "Active military status",
+  permit_req_char      = "State concealed-carry permit requirement",
+  training_req_char    = "State concealed-carry training requirement"
+)
+
+#### Function: build one demographic row-block ####
+summarize_demo <- function(data, dm) {
+
+  # must exist
+  if (!all(c(dm, "wgtpi", "gun_own") %in% names(data))) return(NULL)
+
+  df <- data %>%
+    filter(!is.na(.data[[dm]]), !is.na(wgtpi)) %>%
+    mutate(
+      Level = .data[[dm]] |> factor()  # respects existing factor-level ordering if present
+    )
+
+  if (nrow(df) == 0) return(NULL)
+
+  #### Weighted whole-sample % ####
+  dsgn <- svydesign(ids = ~1, data = df, weights = ~wgtpi)
+  tabw <- svytable(~ Level, dsgn)
+  prop_w <- as.numeric(tabw) / sum(tabw)
+
+  wt_df <- tibble(
+    Level = factor(names(tabw), levels = levels(df$Level)),
+    `% (weighted)` = sprintf("%.1f%%", 100 * prop_w)
+  )
+
+  #### Unweighted Ns (whole sample) ####
+  Ns_total <- df %>%
+    count(Level, name = "N (unwtd)")
+
+  #### Unweighted gun-owner % and Ns ####
+  owner_df <- dat_gunowners_processed %>%
+    filter(!is.na(.data[[dm]])) %>%
+    mutate(Level = factor(.data[[dm]], levels = levels(df$Level))) %>%
+    group_by(Level) %>%
+    summarise(
+      `Gun owners N (unwtd)` = n(),
+      `Gun owners % (unwtd)` =
+        sprintf("%.1f%%", 100 * n() / nrow(dat_gunowners_processed)),
+      .groups = "drop"
+    )
+
+  #### Combine all outputs ####
+  out <- Ns_total %>%
+    full_join(wt_df, by = "Level") %>%
+    full_join(owner_df, by = "Level") %>%
+    mutate(
+      Demographic = unname(demo_titles[dm]) %||% dm
+    ) %>%
+    dplyr::select(
+      Demographic, Level,
+      `% (weighted)`, `N (unwtd)`,
+      `Gun owners % (unwtd)`, `Gun owners N (unwtd)`
+    )
+
+  out
+}
+
+#### Build full table ####
+all_blocks <- lapply(demos, \(dm) summarize_demo(dat_all_processed, dm))
+
+big_tab <- bind_rows(all_blocks) %>%
+  mutate(
+    Demographic = factor(Demographic, levels = unname(demo_titles[demos]))
+  ) %>%
+  arrange(Demographic, Level)
+
+#### Total row ####
+total_n_all <- nrow(dat_all_processed)
+total_n_gun <- nrow(dat_gunowners_processed)
+
+total_row <- tibble(
+  Demographic = "Total",
+  Level = "",
+  `% (weighted)` = "",
+  `N (unwtd)` = total_n_all,
+  `Gun owners % (unwtd)` = "",
+  `Gun owners N (unwtd)` = total_n_gun
+)
+
+big_tab <- bind_rows(big_tab, total_row)
+
+#### Word export ####
+doc <- read_docx()
+doc <- body_add_par(doc, "Demographic overview (whole sample weighted; gun ownership unweighted)", style = "heading 1")
+doc <- body_add_par(
+  doc,
+  "Columns: weighted % of whole sample by level; unweighted N of whole sample; unweighted % gun owners within level; unweighted N gun owners.",
+  style = "Normal"
+)
+doc <- body_add_par(doc, "")
+
+# formatting
+ft <- flextable(big_tab)
+thin <- fp_border(color = "#999999", width = 0.75)
+ft <- theme_booktabs(ft)
+ft <- fontsize(ft, size = 9, part = "all")
+ft <- align(ft, j = 1, align = "left", part = "all")
+ft <- align(ft, j = 2, align = "left", part = "all")
+ft <- align(ft, j = 3:6, align = "center", part = "all")
+ft <- border_remove(ft)
+ft <- hline_top(ft,    part = "header", border = thin)
+ft <- hline_bottom(ft, part = "header", border = thin)
+ft <- hline_bottom(ft, part = "body",   border = thin)
+ft <- autofit(ft)
+ft <- merge_v(ft, j = "Demographic")
+ft <- valign(ft, j = "Demographic", valign = "top")
+
+doc <- body_add_flextable(doc, ft)
+print(doc, target = "output/Demographics_master_table.docx")
+message("Wrote: Demographics_master_table.docx")
+```
+
+Descriptives Tables (Appendix E)
+
+```{r Descriptives | Prep}
+
+# demos to loop over
+demos <- c(
+  "gender_char", "race_char", "age_group_char",
+  "religion_char", "college_char", "income_char",
+  "party_char", "veteran_char", "law_enforcement_char",
+  "active_milit_char", "permit_req_char", "training_req_char"
+)
+
+# return structure of demographic variables in dat_all_processed
+purrr::walk(
+  demos,
+  ~ {
+    cat("\n\n-----------------------------\n")
+    cat("Variable:", .x, "\n")
+    cat("-----------------------------\n")
+    str(dat_all_processed[[.x]])
+  }
+)
+
+# readable titles for each demo
+demo_titles <- c(
+  gender_char           = "Gender",
+  race_char        = "Race/ethnicity",
+  age_group_char   = "Age group",
+  religion_char    = "Religion",
+  college_char     = "Education",
+  income_char      = "Income",
+  party_char       = "Party ID",
+  veteran_char          = "Veteran status",
+  law_enforcement_char  = "Law enforcement status",
+  active_milit_char     = "Active military status",
+  permit_req_char = "State concealed-carry permit requirement",
+  training_req_char= "State concealed-carry training requirement"
+)
+
+# Convenience: keep a consistent demo ordering
+demo_order <- unique(unname(demo_titles[demos]))
+
+# Unweighted descriptive table for any categorical outcome
+summarize_unweighted_demo <- function(data, outcome, dm) {
+  if (!all(c(dm, outcome) %in% names(data))) return(NULL)
+  
+  df <- data %>%
+    dplyr::filter(
+      !is.na(.data[[dm]]),
+      !is.na(.data[[outcome]])
+    ) %>%
+    dplyr::mutate(
+      grp = .data[[dm]],
+      y   = .data[[outcome]]
+    )
+  
+  if (nrow(df) == 0) return(NULL)
+  
+  # Count table
+  tab  <- table(df$grp, df$y)
+  prop <- prop.table(tab, margin = 1)
+  
+  # Convert to wide %
+  prop_df <- as.data.frame(prop) %>%
+    tidyr::pivot_wider(
+      names_from  = Var2,
+      values_from = Freq,
+      names_prefix = "%_"
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::starts_with("%_"),
+        ~ sprintf("%.1f%%", 100 * .x)
+      )
+    ) %>%
+    dplyr::rename(Level = Var1)
+  
+  # N per group
+  Ns <- df %>%
+    dplyr::count(Level = grp, name = "N (unwtd)")
+  
+  # Final table
+  out <- dplyr::left_join(prop_df, Ns, by = "Level") %>%
+    dplyr::mutate(
+      Demographic = unname(demo_titles[dm]) %||% dm
+    ) %>%
+    dplyr::select(Demographic, Level, dplyr::everything())
+  
+  out
+}
+
+# Weighted descriptive table for any categorical outcome
+summarize_weighted_demo <- function(data, outcome, dm) {
+  if (!all(c(dm, outcome, "wgtpi") %in% names(data))) return(NULL)
+  
+  df <- data %>%
+    dplyr::filter(
+      !is.na(.data[[dm]]),
+      !is.na(.data[[outcome]]),
+      !is.na(wgtpi)
+    ) %>%
+    dplyr::mutate(
+      grp = .data[[dm]],
+      y   = .data[[outcome]]
+    )
+  
+  if (nrow(df) == 0) return(NULL)
+  
+  dsgn <- svydesign(ids = ~1, weights = ~wgtpi, data = df)
+  
+  tab  <- svytable(~ grp + y, dsgn)
+  prop <- prop.table(tab, margin = 1)
+  
+  prop_df <- as.data.frame(prop) %>%
+    tidyr::pivot_wider(
+      names_from  = y,
+      values_from = Freq,
+      names_prefix = "%_"
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::starts_with("%_"),
+        ~ sprintf("%.1f%%", 100 * .x)
+      )
+    ) %>%
+    dplyr::rename(Level = grp)
+  
+  Ns <- df %>%
+    dplyr::count(Level = grp, name = "N (unwtd)")
+  
+  out <- dplyr::left_join(prop_df, Ns, by = "Level") %>%
+    dplyr::mutate(
+      Demographic = unname(demo_titles[dm]) %||% dm
+    ) %>%
+    dplyr::select(Demographic, Level, dplyr::everything())
+  
+  out
+}
+
+# Shared flextable formatting
+make_demo_flextable <- function(big_tab) {
+  thin <- officer::fp_border(color = "#999999", width = 0.75)
+  
+  ft <- flextable::flextable(big_tab) %>%
+    flextable::theme_booktabs() %>%
+    flextable::fontsize(size = 9, part = "all") %>%
+    flextable::align(j = 1:2, align = "left",  part = "all") %>%
+    flextable::align(j = 3:ncol(big_tab), align = "center", part = "all") %>%
+    flextable::border_remove() %>%
+    flextable::hline_top(part = "header", border = thin) %>%
+    flextable::hline_bottom(part = "header", border = thin) %>%
+    flextable::hline_bottom(part = "body", border = thin) %>%
+    flextable::autofit() %>%
+    flextable::merge_v(j = "Demographic") %>%
+    flextable::valign(j = "Demographic", valign = "top")
+  
+  ft
+}
+```
+
+```{r Descriptives Table | Gun Ownership (weighted)}
+outcome <- "gun_own"
+
+all_tabs <- lapply(
+  demos,
+  function(dm) {
+    summarize_weighted_demo(
+      data    = dat_all_processed,
+      outcome = outcome,
+      dm      = dm
+    )
+  }
+)
+
+big_tab <- dplyr::bind_rows(all_tabs) %>%
+  dplyr::mutate(
+    Demographic = factor(Demographic, levels = demo_order)
+  ) %>%
+  dplyr::arrange(Demographic, Level)
+
+# Total row
+dsgn_total <- svydesign(
+  ids     = ~1,
+  data    = dat_all_processed %>% dplyr::filter(!is.na(.data[[outcome]])),
+  weights = ~wgtpi
+)
+
+tab_total  <- svytable(~ dat_all_processed[[outcome]], dsgn_total)
+prop_total <- prop.table(tab_total)
+
+total_row <- tibble::tibble(
+  Demographic = "Total sample",
+  Level       = "",
+  !!!setNames(
+    sprintf("%.1f%%", 100 * as.numeric(prop_total)),
+    paste0("%_", names(prop_total))
+  ),
+  `N (unwtd)` = sum(!is.na(dat_all_processed[[outcome]]))
+)
+
+big_tab <- dplyr::bind_rows(big_tab, total_row)
+
+# Export
+doc <- read_docx()
+doc <- body_add_par(
+  doc,
+  "Weighted percentages of respondents who report personally owning firearms by demographic",
+  style = "heading 1"
+)
+doc <- body_add_par(
+  doc,
+  "Percentages are weighted; Ns are unweighted.",
+  style = "Normal"
+)
+doc <- body_add_par(doc, "")
+
+ft <- make_demo_flextable(big_tab)
+doc <- body_add_flextable(doc, ft)
+
+print(doc, target = paste0("output/descriptives_", outcome, "_weighted.docx"))
+message("Wrote: descriptives_", outcome, "_weighted.docx")
+```
+
+```{r Descriptives Table | Gun in Home (weighted)}
+outcome <- "gun_home"
+
+all_tabs <- lapply(
+  demos,
+  function(dm) {
+    summarize_weighted_demo(
+      data    = dat_all_processed,
+      outcome = outcome,
+      dm      = dm
+    )
+  }
+)
+
+big_tab <- dplyr::bind_rows(all_tabs) %>%
+  dplyr::mutate(
+    Demographic = factor(Demographic, levels = demo_order)
+  ) %>%
+  dplyr::arrange(Demographic, Level)
+
+# Total row
+dsgn_total <- svydesign(
+  ids     = ~1,
+  data    = dat_all_processed,
+  weights = ~wgtpi
+)
+
+tab_total  <- svytable(~ dat_all_processed[[outcome]], dsgn_total)
+prop_total <- prop.table(tab_total)
+
+total_row <- tibble::tibble(
+  Demographic = "Total sample",
+  Level       = "",
+  !!!setNames(
+    sprintf("%.1f%%", 100 * as.numeric(prop_total)),
+    paste0("%_", names(prop_total))
+  ),
+  `N (unwtd)` = sum(!is.na(dat_all_processed[[outcome]]))
+)
+
+big_tab <- dplyr::bind_rows(big_tab, total_row)
+
+doc <- read_docx()
+doc <- body_add_par(
+  doc,
+  "Weighted percentages of respondents who report having a firearm in their household by demographic",
+  style = "heading 1"
+)
+doc <- body_add_par(
+  doc,
+  "Percentages are weighted; Ns are unweighted.",
+  style = "Normal"
+)
+doc <- body_add_par(doc, "")
+
+ft <- make_demo_flextable(big_tab)
+doc <- body_add_flextable(doc, ft)
+
+print(doc, target = paste0("output/descriptives_", outcome, "_weighted.docx"))
+message("Wrote: descriptives_", outcome, "_weighted.docx")
+```
+
+```{r Descriptives Table | Purchase Plan (weighted)}
+outcome <- "purchase_plan"
+
+all_tabs <- lapply(
+  demos,
+  function(dm) {
+    summarize_weighted_demo(
+      data    = dat_all_processed,
+      outcome = outcome,
+      dm      = dm
+    )
+  }
+)
+
+big_tab <- dplyr::bind_rows(all_tabs) %>%
+  dplyr::mutate(
+    Demographic = factor(Demographic, levels = demo_order)
+  ) %>%
+  dplyr::arrange(Demographic, Level)
+
+# Total row
+dsgn_total <- svydesign(
+  ids     = ~1,
+  data    = dat_all_processed,
+  weights = ~wgtpi
+)
+
+tab_total  <- svytable(~ dat_all_processed[[outcome]], dsgn_total)
+prop_total <- prop.table(tab_total)
+
+total_row <- tibble::tibble(
+  Demographic = "Total sample",
+  Level       = "",
+  !!!setNames(
+    sprintf("%.1f%%", 100 * as.numeric(prop_total)),
+    paste0("%_", names(prop_total))
+  ),
+  `N (unwtd)` = sum(!is.na(dat_all_processed[[outcome]]))
+)
+
+big_tab <- dplyr::bind_rows(big_tab, total_row)
+
+doc <- read_docx()
+doc <- body_add_par(
+  doc,
+  "Weighted percentages of respondents who intend to purchase a firearm by demographic",
+  style = "heading 1"
+)
+doc <- body_add_par(
+  doc,
+  "Percentages are weighted; Ns are unweighted.",
+  style = "Normal"
+)
+doc <- body_add_par(doc, "")
+
+ft <- make_demo_flextable(big_tab)
+doc <- body_add_flextable(doc, ft)
+
+print(doc, target = paste0("output/descriptives_", outcome, "_weighted.docx"))
+message("Wrote: descriptives_", outcome, "_weighted.docx")
+```
+
+```{r Descriptives Table | Gun Type (cat; weighted)}
+
+outcome <- "gun_type_cat"
+
+all_tabs <- lapply(
+  demos,
+  function(dm) {
+    summarize_weighted_demo(
+      data    = dat_all_processed,
+      outcome = outcome,
+      dm      = dm
+    )
+  }
+)
+
+# Combine + order by demographic and level
+big_tab <- dplyr::bind_rows(all_tabs) %>%
+  dplyr::mutate(
+    Demographic = factor(Demographic, levels = demo_order)
+  ) %>%
+  dplyr::arrange(Demographic, Level)
+
+# Total row (weighted %)
+dsgn_total <- svydesign(
+  ids     = ~1,
+  data    = dat_all_processed %>% dplyr::filter(!is.na(.data[[outcome]])),
+  weights = ~wgtpi
+)
+
+tab_total  <- svytable(~ get(outcome), dsgn_total)
+prop_total <- prop.table(tab_total)
+
+total_row <- tibble::tibble(
+  Demographic = "Total sample",
+  Level       = "",
+  !!!setNames(
+    sprintf("%.1f%%", 100 * as.numeric(prop_total)),
+    paste0("%_", names(prop_total))
+  ),
+  `N (unwtd)` = sum(!is.na(dat_all_processed[[outcome]]))
+)
+
+big_tab <- dplyr::bind_rows(big_tab, total_row)
+
+# Export to Word
+doc <- read_docx()
+doc <- body_add_par(
+  doc,
+  "Weighted percentages of firearm type categories by demographic",
+  style = "heading 1"
+)
+doc <- body_add_par(
+  doc,
+  "Percentages are weighted; Ns are unweighted.",
+  style = "Normal"
+)
+doc <- body_add_par(doc, "")
+
+ft <- make_demo_flextable(big_tab)
+
+doc <- body_add_flextable(doc, ft)
+
+print(doc, target = paste0("output/descriptives_", outcome, "_weighted.docx"))
+message("Wrote: descriptives_", outcome, "_weighted.docx")
+```
+
+```{r Descriptives Table | Carry Frequency (cat; gun owners)}
+
+outcome <- "carry_freq_cat"
+
+all_tabs <- lapply(
+  demos,
+  function(dm) {
+    summarize_unweighted_demo(
+      data    = dat_gunowners_processed,
+      outcome = outcome,
+      dm      = dm
+    )
+  }
+)
+
+big_tab <- dplyr::bind_rows(all_tabs) %>%
+  dplyr::mutate(
+    Demographic = factor(Demographic, levels = demo_order)
+  ) %>%
+  dplyr::arrange(Demographic, Level)
+
+tab_total  <- table(dat_gunowners_processed[[outcome]])
+prop_total <- prop.table(tab_total)
+
+total_row <- tibble::tibble(
+  Demographic = "Total sample",
+  Level       = "",
+  !!!setNames(
+    sprintf("%.1f%%", 100 * as.numeric(prop_total)),
+    paste0("%_", names(prop_total))
+  ),
+  `N (unwtd)` = sum(!is.na(dat_gunowners_processed[[outcome]]))
+)
+
+big_tab <- dplyr::bind_rows(big_tab, total_row)
+
+doc <- read_docx()
+doc <- body_add_par(
+  doc,
+  "Unweighted percentages of gun owners’ carry frequency in the past 30 days by demographic",
+  style = "heading 1"
+)
+doc <- body_add_par(
+  doc,
+  "Percentages and Ns are unweighted.",
+  style = "Normal"
+)
+doc <- body_add_par(doc, "")
+
+ft <- make_demo_flextable(big_tab)
+doc <- body_add_flextable(doc, ft)
+
+print(
+  doc,
+  target = paste0("output/descriptives_", outcome, "_unweighted_gun_owners.docx")
+)
+message(
+  "Wrote: descriptives_",
+  outcome,
+  "_unweighted_gun_owners.docx"
+)
+```
+
+```{r Descriptives Table | Carry Type (cat; gun owners)}
+
+outcome <- "carry_type_cat"
+
+all_tabs <- lapply(
+  demos,
+  function(dm) {
+    summarize_unweighted_demo(
+      data    = dat_gunowners_processed,
+      outcome = outcome,
+      dm      = dm
+    )
+  }
+)
+
+big_tab <- dplyr::bind_rows(all_tabs) %>%
+  dplyr::mutate(
+    Demographic = factor(Demographic, levels = demo_order)
+  ) %>%
+  dplyr::arrange(Demographic, Level)
+
+tab_total  <- table(dat_gunowners_processed[[outcome]])
+prop_total <- prop.table(tab_total)
+
+total_row <- tibble::tibble(
+  Demographic = "Total sample",
+  Level       = "",
+  !!!setNames(
+    sprintf("%.1f%%", 100 * as.numeric(prop_total)),
+    paste0("%_", names(prop_total))
+  ),
+  `N (unwtd)` = sum(!is.na(dat_gunowners_processed[[outcome]]))
+)
+
+big_tab <- dplyr::bind_rows(big_tab, total_row)
+
+doc <- read_docx()
+doc <- body_add_par(
+  doc,
+  "Unweighted percentages of gun owners’ carry type by demographic",
+  style = "heading 1"
+)
+doc <- body_add_par(
+  doc,
+  "Percentages and Ns are unweighted.",
+  style = "Normal"
+)
+doc <- body_add_par(doc, "")
+
+ft <- make_demo_flextable(big_tab)
+doc <- body_add_flextable(doc, ft)
+
+print(
+  doc,
+  target = paste0("output/descriptives_", outcome, "_unweighted_gun_owners.docx")
+)
+message(
+  "Wrote: descriptives_",
+  outcome,
+  "_unweighted_gun_owners.docx"
+)
+```
+
+```{r Descriptives Table | Carry (concealed OR open; gun owners)}
+
+outcome <- "carry"
+
+all_tabs <- lapply(
+  demos,
+  function(dm) {
+    summarize_unweighted_demo(
+      data    = dat_gunowners_processed,
+      outcome = outcome,
+      dm      = dm
+    )
+  }
+)
+
+big_tab <- dplyr::bind_rows(all_tabs) %>%
+  dplyr::mutate(
+    Demographic = factor(Demographic, levels = demo_order)
+  ) %>%
+  dplyr::arrange(Demographic, Level)
+
+tab_total  <- table(dat_gunowners_processed[[outcome]])
+prop_total <- prop.table(tab_total)
+
+total_row <- tibble::tibble(
+  Demographic = "Total sample",
+  Level       = "",
+  `% (No)`    = sprintf("%.1f%%", 100 * prop_total["0"]),
+  `% (Yes)`   = sprintf("%.1f%%", 100 * prop_total["1"]),
+  `N (unwtd)` = sum(!is.na(dat_gunowners_processed[[outcome]]))
+)
+
+big_tab <- dplyr::bind_rows(big_tab, total_row)
+
+doc <- read_docx()
+doc <- body_add_par(
+  doc,
+  "Unweighted percentages of gun owners who report carrying firearms in public (concealed or open) by demographic",
+  style = "heading 1"
+)
+doc <- body_add_par(
+  doc,
+  "Percentages and Ns are unweighted.",
+  style = "Normal"
+)
+doc <- body_add_par(doc, "")
+
+ft <- make_demo_flextable(big_tab)
+doc <- body_add_flextable(doc, ft)
+
+print(
+  doc,
+  target = paste0("output/descriptives_", outcome, "_unweighted_gun_owners.docx")
+)
+message(
+  "Wrote: descriptives_",
+  outcome,
+  "_unweighted_gun_owners.docx"
+)
+```
+
+```{r Descriptives Table | Concealed Carry (gun owners)}
+
+outcome <- "concealed_carry"
+
+all_tabs <- lapply(
+  demos,
+  function(dm) {
+    summarize_unweighted_demo(
+      data    = dat_gunowners_processed,
+      outcome = outcome,
+      dm      = dm
+    )
+  }
+)
+
+big_tab <- dplyr::bind_rows(all_tabs) %>%
+  dplyr::mutate(
+    Demographic = factor(Demographic, levels = demo_order)
+  ) %>%
+  dplyr::arrange(Demographic, Level)
+
+tab_total  <- table(dat_gunowners_processed[[outcome]])
+prop_total <- prop.table(tab_total)
+
+total_row <- tibble::tibble(
+  Demographic = "Total sample",
+  Level       = "",
+  `% (No)`    = sprintf("%.1f%%", 100 * prop_total["0"]),
+  `% (Yes)`   = sprintf("%.1f%%", 100 * prop_total["1"]),
+  `N (unwtd)` = sum(!is.na(dat_gunowners_processed[[outcome]]))
+)
+
+big_tab <- dplyr::bind_rows(big_tab, total_row)
+
+doc <- read_docx()
+doc <- body_add_par(
+  doc,
+  "Unweighted percentages of gun owners who report concealed carry of firearms in public by demographic",
+  style = "heading 1"
+)
+doc <- body_add_par(
+  doc,
+  "Percentages and Ns are unweighted.",
+  style = "Normal"
+)
+doc <- body_add_par(doc, "")
+
+ft <- make_demo_flextable(big_tab)
+doc <- body_add_flextable(doc, ft)
+
+print(
+  doc,
+  target = paste0("output/descriptives_", outcome, "_unweighted_gun_owners.docx")
+)
+message(
+  "Wrote: descriptives_",
+  outcome,
+  "_unweighted_gun_owners.docx"
+)
+```
+
+```{r Descriptives Table | Open Carry (gun owners)}
+
+outcome <- "open_carry"
+
+all_tabs <- lapply(
+  demos,
+  function(dm) {
+    summarize_unweighted_demo(
+      data    = dat_gunowners_processed,
+      outcome = outcome,
+      dm      = dm
+    )
+  }
+)
+
+big_tab <- dplyr::bind_rows(all_tabs) %>%
+  dplyr::mutate(
+    Demographic = factor(Demographic, levels = demo_order)
+  ) %>%
+  dplyr::arrange(Demographic, Level)
+
+tab_total  <- table(dat_gunowners_processed[[outcome]])
+prop_total <- prop.table(tab_total)
+
+total_row <- tibble::tibble(
+  Demographic = "Total sample",
+  Level       = "",
+  `% (No)`    = sprintf("%.1f%%", 100 * prop_total["0"]),
+  `% (Yes)`   = sprintf("%.1f%%", 100 * prop_total["1"]),
+  `N (unwtd)` = sum(!is.na(dat_gunowners_processed[[outcome]]))
+)
+
+big_tab <- dplyr::bind_rows(big_tab, total_row)
+
+doc <- read_docx()
+doc <- body_add_par(
+  doc,
+  "Unweighted percentages of gun owners who report open carry of firearms in public by demographic",
+  style = "heading 1"
+)
+doc <- body_add_par(
+  doc,
+  "Percentages and Ns are unweighted.",
+  style = "Normal"
+)
+doc <- body_add_par(doc, "")
+
+ft <- make_demo_flextable(big_tab)
+doc <- body_add_flextable(doc, ft)
+
+print(
+  doc,
+  target = paste0("output/descriptives_", outcome, "_unweighted_gun_owners.docx")
+)
+message(
+  "Wrote: descriptives_",
+  outcome,
+  "_unweighted_gun_owners.docx"
+)
+```
+
+***CLUSTERED SEs Word Tables of Main Models***
+Appendix H, J, K, L, M, N, O
+
+```{r Master Analyses Code | Functions and Specs}
+# Note: control_vars, state_sets, model_titles, var_labels, and var_order
+# are defined in the "Shared analysis specifications" chunk above
+
+#### Build controls formula ####
+controls_formula <- paste(control_vars, collapse = " + ")
+
+#### Build model formulas (shared structure) ####
+build_formulas <- function(dv) {
+  f0 <- as.formula(glue("{dv} ~ {main_iv}"))
+  f1 <- as.formula(glue("{dv} ~ {main_iv} + {controls_formula}"))
+  f_states <- lapply(state_sets, function(sc) {
+    as.formula(glue("{dv} ~ {main_iv} + {controls_formula} + {sc}"))
+  })
+  out <- c(list(f0, f1), f_states)
+  names(out) <- model_titles
+  out
+}
+
+#### Logistic models: survey design with state clustering ####
+fit_survey_clustered <- function(fml, df, weight_var = NULL) {
+  
+  if (!is.null(weight_var)) {
+    df <- df %>%
+      filter(
+        !is.na(.data[[weight_var]]),
+        !is.na(state)
+      )
+  } else {
+    df <- df %>%
+      filter(!is.na(state))
+  }
+  
+  if (!is.null(weight_var)) {
+    w_fml <- as.formula(paste0("~", weight_var))
+    design <- svydesign(
+      ids     = ~state,
+      weights = w_fml,
+      data    = df
+    )
+  } else {
+    design <- svydesign(
+      ids     = ~state,
+      weights = NULL,
+      data    = df
+    )
+  }
+  
+  fit <- svyglm(
+    formula = fml,
+    design  = design,
+    family  = quasibinomial()
+  )
+  
+  broom::tidy(fit, conf.int = FALSE) %>%
+    mutate(
+      OR    = exp(estimate),
+      SE    = std.error,
+      p     = p.value,
+      stars = sig_stars(p)
+    ) %>%
+    dplyr::select(term, OR, SE, p, stars)
+}
+
+#### Multinomial: clustered vcov helper ####
+vcov_cluster_multinom <- function(model, cluster) {
+  
+  mf <- model$model
+  if (is.null(mf)) {
+    stop("Model must be fit with model = TRUE")
+  }
+  
+  X <- model.matrix(terms(model), data = mf)
+  fitted_probs <- fitted(model)
+  y <- model.response(mf)
+  
+  y_levels <- levels(y)
+  n <- nrow(X)
+  k <- length(y_levels)
+  
+  Y_mat <- matrix(0, n, k)
+  for (i in seq_len(k)) {
+    Y_mat[, i] <- as.numeric(y == y_levels[i])
+  }
+  
+  p <- ncol(X)
+  k_minus_1 <- k - 1
+  
+  scores <- matrix(0, n, p * k_minus_1)
+  for (i in seq_len(n)) {
+    for (j in seq_len(k_minus_1)) {
+      idx_start <- (j - 1) * p + 1
+      idx_end   <- j * p
+      resid <- Y_mat[i, j + 1] - fitted_probs[i, j + 1]
+      scores[i, idx_start:idx_end] <- resid * X[i, ]
+    }
+  }
+  
+  clusters <- unique(cluster)
+  n_clusters <- length(clusters)
+  
+  cluster_scores <- matrix(0, n_clusters, ncol(scores))
+  for (c in seq_len(n_clusters)) {
+    idx <- which(cluster == clusters[c])
+    cluster_scores[c, ] <- colSums(scores[idx, , drop = FALSE])
+  }
+  
+  meat <- crossprod(cluster_scores)
+  vcov_model <- vcov(model)
+  
+  adj <- n_clusters / (n_clusters - 1) *
+    (n - 1) / (n - p * k_minus_1)
+  
+  vcov_model %*% meat %*% vcov_model * adj
+}
+
+#### Multinomial: optional diagnostics for clustering ####
+verify_clustered_ses <- function(model, cluster_var, data) {
+  
+  se_standard <- sqrt(diag(vcov(model)))
+  vcov_robust <- vcov_cluster_multinom(model, cluster = data[[cluster_var]])
+  se_clustered <- sqrt(diag(vcov_robust))
+  
+  se_comparison <- data.frame(
+    Parameter    = names(se_standard),
+    Standard_SE  = se_standard,
+    Clustered_SE = se_clustered,
+    Ratio        = se_clustered / se_standard
+  )
+  
+  cat("\n==============================\n")
+  cat("CLUSTERED SE DIAGNOSTICS\n")
+  cat("==============================\n\n")
+  cat("Mean ratio:", sprintf("%.3f", mean(se_comparison$Ratio)), "\n")
+  cat("Min ratio:", sprintf("%.3f", min(se_comparison$Ratio)), "\n")
+  cat("Max ratio:", sprintf("%.3f", max(se_comparison$Ratio)), "\n\n")
+  
+  list(
+    se_comparison = se_comparison,
+    vcov_robust   = vcov_robust
+  )
+}
+
+#### Multinomial: fit function (clustered or unclustered) ####
+fit_multinom_generic <- function(
+  fml,
+  data,
+  cluster_var = "state",
+  clustered   = TRUE,
+  verify      = FALSE
+) {
+  
+  data <- data %>%
+    filter(!is.na(!!rlang::sym(cluster_var)))
+  
+  m <- multinom(fml, data = data, trace = FALSE, model = TRUE)
+  
+  if (clustered) {
+    if (verify) {
+      ver <- verify_clustered_ses(m, cluster_var, data)
+      vc <- ver$vcov_robust
+    } else {
+      vc <- vcov_cluster_multinom(m, cluster = data[[cluster_var]])
+    }
+  } else {
+    vc <- vcov(m)
+  }
+  
+  coefs <- coef(m)
+  if (!is.matrix(coefs)) {
+    coefs <- matrix(coefs, nrow = 1)
+    rownames(coefs) <- levels(m$y)[2]
+  }
+  
+  outcome_levels  <- rownames(coefs)
+  predictor_names <- colnames(coefs)
+  n_pred          <- length(predictor_names)
+  
+  se_vec <- sqrt(diag(vc))
+  
+  results_list <- list()
+  
+  for (i in seq_len(nrow(coefs))) {
+    outcome <- outcome_levels[i]
+    idx_start <- (i - 1) * n_pred + 1
+    idx_end   <- i * n_pred
+    
+    results_list[[outcome]] <- data.frame(
+      y.level    = outcome,
+      term       = predictor_names,
+      estimate   = coefs[i, ],
+      std.error  = se_vec[idx_start:idx_end],
+      stringsAsFactors = FALSE
+    ) %>%
+      mutate(
+        RRR   = exp(estimate),
+        SE    = std.error,
+        z     = estimate / std.error,
+        p     = 2 * pnorm(abs(z), lower.tail = FALSE),
+        stars = sig_stars(p)
+      ) %>%
+      dplyr::select(y.level, term, RRR, SE, stars)
+  }
+  
+  bind_rows(results_list)
+}
+
+#### Format logistic results: one row per term, one column per model ####
+format_results_wide_logit <- function(results_list) {
+  
+  processed <- purrr::imap(results_list, function(df, model_name) {
+    df %>%
+      mutate(
+        Term     = var_labels[term] %||% term,
+        or_value  = sprintf("%.2f\n(%.2f)", OR, SE),
+        star_val  = stars
+      ) %>%
+      dplyr::select(term, Term, or_value, star_val) %>%
+      rename(
+        !!model_name           := or_value,
+        !!paste0(model_name,
+                 "_stars")     := star_val
+      )
+  })
+  
+  all_terms <- data.frame(
+    term = c("(Intercept)", var_order),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(Term = var_labels[term] %||% term)
+  
+  result_df <- all_terms
+  
+  for (i in seq_along(processed)) {
+    result_df <- result_df %>%
+      full_join(
+        processed[[i]] %>%
+          dplyr::select(term, everything(), -Term),
+        by = "term"
+      )
+  }
+  
+  result_df %>%
+    mutate(
+      order_index = ifelse(term == "(Intercept)", 0,
+                           match(term, var_order))
+    ) %>%
+    filter(!is.na(order_index)) %>%
+    arrange(order_index) %>%
+    dplyr::select(-order_index, -term)
+}
+
+#### Format multinomial results: stacked by outcome, cc_no_permit first ####
+format_results_wide_multinom <- function(results_list) {
+  
+  formatted <- imap(results_list, function(df, model_name) {
+    df %>%
+      mutate(
+        Term     = var_labels[term] %||% term,
+        rrr_disp  = sprintf("%.2f\n(%.2f)", RRR, SE),
+        star_disp = stars
+      ) %>%
+      dplyr::select(y.level, term, Term, rrr_disp, star_disp) %>%
+      rename(
+        !!model_name           := rrr_disp,
+        !!paste0(model_name,
+                 "_stars")     := star_disp
+      )
+  })
+  
+  all_terms <- data.frame(
+    term = c("(Intercept)", var_order),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(Term = var_labels[term] %||% term)
+  
+  all_outcomes <- unique(formatted[[1]]$y.level)
+  wide_by_outcome <- list()
+  
+  for (outcome in all_outcomes) {
+    
+    outcome_data <- all_terms
+    
+    for (i in seq_along(formatted)) {
+      model_data <- formatted[[i]] %>%
+        filter(y.level == outcome) %>%
+        dplyr::select(-y.level, -Term)
+      
+      outcome_data <- outcome_data %>%
+        left_join(model_data, by = "term")
+    }
+    
+    outcome_data <- outcome_data %>%
+      mutate(
+        is_cc = ifelse(term == "cc_no_permit", 0, 1),
+        order_index = ifelse(
+          term == "cc_no_permit",
+          0,
+          match(term, var_order)
+        )
+      ) %>%
+      arrange(is_cc, order_index) %>%
+      dplyr::select(-is_cc, -order_index) %>%
+      mutate(y.level = outcome) %>%
+      dplyr::select(y.level, Term, everything(), -term)
+    
+    wide_by_outcome[[outcome]] <- outcome_data
+  }
+  
+  bind_rows(wide_by_outcome)
+}
+
+#### Word export for logistic models ####
+run_logit_models_to_word <- function(
+  dv,
+  data,
+  weight_var = NULL,
+  file_name
+) {
+  
+  formulas <- build_formulas(dv)
+  
+  weight_status <- if (!is.null(weight_var)) "Weighted" else "Unweighted"
+  message("\n", paste(rep("=", 60), collapse = ""))
+  message(weight_status, " analysis with state clustering for DV: ", dv)
+  message(paste(rep("=", 60), collapse = ""), "\n")
+  
+  results_list <- imap(
+    formulas,
+    function(fml, nm) {
+      message("Fitting model: ", nm)
+      fit_survey_clustered(
+        fml,
+        df         = data,
+        weight_var = weight_var
+      )
+    }
+  )
+  
+  final_table <- format_results_wide_logit(results_list)
+  ft <- flextable(final_table)
+  
+  # Remove header text for stars columns
+  star_cols <- grep("_stars$", names(final_table))
+  for (col_idx in star_cols) {
+    ft <- set_header_labels(
+      ft,
+      values = setNames("", names(final_table)[col_idx])
+    )
+  }
+  
+    # ---- FIRST autofit for row height only ----
+  ft <- autofit(ft)
+
+  # ---- THEN apply column widths (autofit can no longer override them) ----
+
+  ncols <- ncol(final_table)
+
+  # 1) Term column
+  ft <- width(ft, j = 1, width = 1.4)
+
+  # 2) Default width for all other model OR columns
+  ft <- width(ft, j = 2:ncols, width = 0.85)
+
+  # 3) Odd-numbered columns (3,5,7,...) get narrow width
+  #    these correspond to OR(SE) columns
+  odd_cols <- seq(3, min(18, ncols), by = 2)
+  ft <- width(ft, j = odd_cols, width = 0.35)
+
+  # ---- Now alignment / fonts ----
+  ft <- bold(ft, part = "header")
+  ft <- align(ft, align = "center", part = "header")
+  ft <- align(ft, j = 1, align = "left", part = "body")
+  ft <- align(ft, j = -1, align = "center", part = "body")
+
+  # Set font defaults
+  ft <- font(ft, fontname = "Times New Roman", part = "all")
+  ft <- fontsize(ft, size = 10, part = "all")
+  
+  doc <- read_docx()
+  doc <- body_add_par(
+    doc,
+    glue("{weight_status} clustered logit models: {dv}"),
+    style = "heading 1"
+  )
+  doc <- body_add_flextable(doc, ft)
+  
+  print(doc, target = file_name)
+  message("✓ Wrote: ", file_name)
+}
+
+#### Word export for multinomial models ####
+run_multinom_models_to_word <- function(
+  dv,
+  data,
+  file_name,
+  clustered = TRUE,
+  verify_ses = FALSE
+) {
+  
+  formulas <- build_formulas(dv)
+  
+  results_list <- imap(
+    formulas,
+    function(fml, nm) {
+      message("Fitting: ", nm)
+      fit_multinom_generic(
+        fml,
+        data       = data,
+        clustered  = clustered,
+        verify     = verify_ses
+      )
+    }
+  )
+  
+  final_table <- format_results_wide_multinom(results_list)
+  ft <- flextable(final_table)
+  
+  # Remove header text for stars columns
+  star_cols <- grep("_stars$", names(final_table))
+  for (col_idx in star_cols) {
+    ft <- set_header_labels(
+      ft,
+      values = setNames("", names(final_table)[col_idx])
+    )
+  }
+  
+    # ---- Apply human-readable model titles to estimate columns ----
+  est_cols <- which(!grepl("_stars$", names(final_table)) &
+                     !names(final_table) %in% c("y.level", "Term"))
+
+  # Sanity check: number of estimate columns should match model_titles
+  stopifnot(length(est_cols) == length(model_titles))
+
+  ft <- set_header_labels(
+    ft,
+    values = setNames(model_titles, names(final_table)[est_cols])
+  )
+  
+  # ---- ONE autofit pass only ----
+  ft <- autofit(ft)
+  
+  # ---- Explicit column widths (override autofit) ----
+  ncols <- ncol(final_table)
+  
+  # Outcome label column
+  ft <- width(ft, j = 1, width = 1.0)
+  
+  # Term column
+  ft <- width(ft, j = 2, width = 1.4)
+  
+  # Default width for remaining columns
+  if (ncols >= 3) {
+    ft <- width(ft, j = 3:ncols, width = 0.85)
+  }
+  
+  # Narrow estimate columns (3, 5, 7, ...)
+  odd_cols <- seq(4, ncols, by = 2)
+  ft <- width(ft, j = odd_cols, width = 0.35)
+  
+  # ---- Styling ----
+  ft <- bold(ft, part = "header")
+  ft <- align(ft, align = "center", part = "header")
+  ft <- align(ft, j = 1:2, align = "left",  part = "body")
+  ft <- align(ft, j = -(1:2), align = "center", part = "body")
+  
+  # Font defaults
+  ft <- font(ft, fontname = "Times New Roman", part = "all")
+  ft <- fontsize(ft, size = 10, part = "all")
+  
+  doc <- read_docx()
+  se_type <- if (clustered) "State-clustered" else "Standard (unclustered)"
+  
+  doc <- body_add_par(
+    doc,
+    glue("Multinomial logit with {se_type} SEs: {dv}"),
+    style = "heading 1"
+  )
+  doc <- body_add_par(
+    doc,
+    glue("Baseline category: {levels(data[[dv]])[1]}"),
+    style = "Normal"
+  )
+  doc <- body_add_flextable(doc, ft)
+  
+  print(doc, target = file_name)
+  message("✓ Wrote Word document: ", file_name)
+}
+```
+
+```{r Master Analyses Code | Create Main Model Documents}
+#### Usage: logistic models (weighted + unweighted) ####
+run_logit_models_to_word(
+  dv         = "gun_own",
+  data       = dat_all_processed,
+  weight_var = "wgtpi",
+  file_name  = "output/clustered_models_gun_own_WEIGHTED.docx"
+)
+
+run_logit_models_to_word(
+  dv         = "gun_own",
+  data       = dat_all_processed,
+  weight_var = NULL,
+  file_name  = "output/clustered_models_gun_own_UNWEIGHTED.docx"
+)
+
+run_logit_models_to_word(
+  dv         = "purchase_plan",
+  data       = dat_NONgunowners_processed,
+  weight_var = NULL,
+  file_name  = "output/clustered_models_purchase_plan_UNWEIGHTED_non-owners.docx"
+)
+
+run_logit_models_to_word(
+  dv         = "purchase_plan",
+  data       = dat_gunowners_processed,
+  weight_var = NULL,
+  file_name  = "output/clustered_models_purchase_plan_UNWEIGHTED_owners.docx"
+)
+
+run_logit_models_to_word(
+  dv         = "gun_home",
+  data       = dat_all_processed,
+  weight_var = "wgtpi",
+  file_name  = "output/clustered_models_gun_home_WEIGHTED.docx"
+)
+
+run_logit_models_to_word(
+  dv         = "gun_home",
+  data       = dat_all_processed,
+  weight_var = NULL,
+  file_name  = "output/clustered_models_gun_home_UNWEIGHTED.docx"
+)
+
+#### Usage: logistic models for partial samples (unweighted) ####
+run_logit_models_to_word(
+  dv         = "carry",
+  data       = dat_gunowners_processed,
+  weight_var = NULL,
+  file_name  = "output/clustered_models_carry_UNWEIGHTED.docx"
+)
+
+run_logit_models_to_word(
+  dv         = "open_carry",
+  data       = dat_gunowners_processed,
+  weight_var = NULL,
+  file_name  = "output/clustered_models_open_carry_UNWEIGHTED.docx"
+)
+
+run_logit_models_to_word(
+  dv         = "carry",
+  data       = dat_gunowners_processed_nomin,
+  weight_var = NULL,
+  file_name  = "output/clustered_models_carry_UNWEIGHTED_nomin.docx"
+)
+
+run_logit_models_to_word(
+  dv         = "open_carry",
+  data       = dat_gunowners_processed_nomin,
+  weight_var = NULL,
+  file_name  = "output/clustered_models_open_carry_UNWEIGHTED_nomin.docx"
+)
+
+#### Usage: multinomial models ####
+
+## Gun type, all respondents (clustered)
+run_multinom_models_to_word(
+  dv         = "gun_type_cat",
+  data       = dat_all_processed,
+  file_name  = "output/models_gun_type_multinomial_CLUSTERED.docx",
+  clustered  = TRUE,
+  verify_ses = FALSE
+)
+
+## Gun type, non-gun-owners (clustered)
+run_multinom_models_to_word(
+  dv         = "gun_type_cat",
+  data       = dat_NONgunowners_processed,
+  file_name  = "output/models_gun_type_multinomial_CLUSTERED_non-owners.docx",
+  clustered  = TRUE,
+  verify_ses = FALSE
+)
+
+## Gun type, all respondents (unclustered)
+run_multinom_models_to_word(
+  dv         = "gun_type_cat",
+  data       = dat_all_processed,
+  file_name  = "output/models_gun_type_multinomial_UNCLUSTERED.docx",
+  clustered  = FALSE,
+  verify_ses = FALSE
+)
+
+## Carry frequency, gun owners (clustered)
+run_multinom_models_to_word(
+  dv         = "carry_freq_cat",
+  data       = dat_gunowners_processed,
+  file_name  = "output/models_carry_freq_multinomial_CLUSTERED.docx",
+  clustered  = TRUE,
+  verify_ses = FALSE
+)
+
+## Carry frequency, gun owners, no small-N states (clustered)
+run_multinom_models_to_word(
+  dv         = "carry_freq_cat",
+  data       = dat_gunowners_processed_nomin,
+  file_name  = "output/models_carry_freq_multinomial_CLUSTERED_nomin.docx",
+  clustered  = TRUE,
+  verify_ses = FALSE
+)
+
+## Carry type, gun owners (clustered)
+run_multinom_models_to_word(
+  dv         = "carry_type_cat",
+  data       = dat_gunowners_processed,
+  file_name  = "output/models_carry_type_multinomial_CLUSTERED.docx",
+  clustered  = TRUE,
+  verify_ses = FALSE
+)
+
+## Carry type, gun owners, no small-N states (clustered)
+run_multinom_models_to_word(
+  dv         = "carry_type_cat",
+  data       = dat_gunowners_processed_nomin,
+  file_name  = "output/models_carry_type_multinomial_CLUSTERED_nomin.docx",
+  clustered  = TRUE,
+  verify_ses = FALSE
+)
+
+#### Play Lindsey Buckingham saying "organic" when everything is done ####
+play(load.wave("Organic.wav"))
+```
+
+```{r Model Doc Creation | Purchase Plan | All | Controlling for Gun Ownership}
+# Separate chunk because we're changing the controls
+# Use gun ownership variants from shared specs
+controls_formula <- paste(control_vars_gunown, collapse = " + ")
+var_labels <- var_labels_gunown
+var_order <- var_order_gunown
+
+# WEIGHTED purchase_plan
+run_logit_models_to_word(
+  dv         = "purchase_plan",
+  data       = dat_all_processed,
+  weight_var = "wgtpi",
+  file_name  = "output/clustered_models_purchase_plan_WEIGHTED.docx"
+)
+
+# UNWEIGHTED purchase_plan
+run_logit_models_to_word(
+  dv         = "purchase_plan",
+  data       = dat_all_processed,
+  weight_var = NULL,
+  file_name  = "output/clustered_models_purchase_plan_UNWEIGHTED.docx"
+)
+
+# Play Lindsey Buckingham saying "organic" when the document is done
+play(load.wave("Organic.wav"))
+
+```
+
+Note on estimation approach for weighted models:
+We use survey::svyglm() to correctly handle probability weights (wgtpi) 
+with state-level clustering. This approach properly accounts for both the 
+sampling weights and within-state correlation. Comparison with glm() + 
+vcovCL() shows materially equivalent results, but the survey package is 
+preferred as it correctly treats weights as inverse selection probabilities 
+rather than frequency weights
+
+***Random intercept models***
+Appendix I
+```{r Document Creation Setup}
+#### SETUP (binary-only workflow) ####
+# Note: control_vars, state_sets, model_titles, var_labels, and var_order
+# are defined in the "Shared Analysis Specifications" chunk
+
+# Binary DVs we plan to use
+allowed_binary_dvs <- c("carry", "open_carry", "gun_home","gun_own","purchase_plan")
+
+# Build controls formula for this chunk
+individual_controls <- paste(control_vars, collapse = " + ")
+
+# Cell formatter
+fmt_coef_se <- function(est, se) {
+  ifelse(is.na(est), "", paste0(sprintf("%.2f", est), "\n(", sprintf("%.2f", se), ")"))
+}
+
+#### MODEL & EXPORT HELPERS ####
+
+# Build model formulas for one DV (all with random intercept for state)
+build_formulas_for_dv <- function(dv) {
+  f0 <- as.formula(glue("{dv} ~ cc_no_permit + (1 | state)"))
+  f1 <- as.formula(glue("{dv} ~ cc_no_permit + {individual_controls} + (1 | state)"))
+  f_state <- lapply(state_sets, function(ss)
+    as.formula(glue("{dv} ~ cc_no_permit + {individual_controls} + {ss} + (1 | state)"))
+  )
+  c(list(f0, f1), f_state)
+}
+
+# Always fit GLMM (binary DV): logit with random intercept for state
+fit_me <- function(fml, data) {
+  glmer(fml, data = data, family = binomial(),
+        control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+}
+
+# Tidy GLMM fixed effects; report OR and delta-method SE(OR) ≈ OR * SE(log-odds)
+tidy_glmm_or <- function(mod) {
+  tt <- broom.mixed::tidy(mod, effects = "fixed", conf.int = FALSE)
+  tt <- tt %>%
+    mutate(
+      OR     = exp(estimate),
+      se_or  = OR * std.error,
+      p      = if ("p.value" %in% names(.)) p.value else
+                 tryCatch(2 * pnorm(-abs(statistic)), error = function(e) NA_real_)
+    )
+  tt
+}
+
+# Assemble the wide table for one DV and return both the table & models
+assemble_table_for_dv <- function(dv, data) {
+  stopifnot(dv %in% allowed_binary_dvs)
+  fmls <- build_formulas_for_dv(dv)
+
+  mods <- map(fmls, fit_me, data = data)
+  names(mods) <- model_titles[seq_along(mods)]
+
+  # Tidy each model and reshape into [var, <title>_coef_se, <title>_stars]
+  pieces <- imap(mods, function(m, nm) {
+    ti <- tidy_glmm_or(m) %>%
+      filter(term != "(Intercept)") %>%
+      mutate(
+        var     = var_labels[term] %||% term,
+        coef_se = fmt_coef_se(OR, se_or),
+        stars   = sig_stars(p)
+      ) %>%
+      dplyr::select(var, coef_se, stars)
+    names(ti)[2:3] <- c(paste0(nm, "_coef_se"), paste0(nm, "_stars"))
+    ti
+  })
+
+  wide <- reduce(pieces, full_join, by = "var")
+  wide[is.na(wide)] <- ""
+
+  list(table = wide, models = mods)
+}
+
+# Compact flextable builder (expects columns: Variable + repeated pairs)
+build_flextable_for_dv <- function(dv, tab2) {
+
+  stopifnot("Variable" %in% names(tab2))
+
+  coef_cols  <- grep("_coef_se$",  names(tab2))
+  stars_cols <- grep("_stars$",    names(tab2))
+  stopifnot(length(coef_cols) == length(stars_cols))
+
+  cols_no_var  <- names(tab2)[-1]
+  lower_labels <- ifelse(
+    endsWith(cols_no_var, "_coef_se"),
+    "Coef (SE)",
+    "Sig."
+  )
+
+  groups  <- sub("_(coef_se|stars)$", "", cols_no_var)
+  grp_rle <- rle(groups)
+
+  ft <- flextable::flextable(tab2)
+  ft <- flextable::theme_booktabs(ft)
+
+  # bottom header row labels
+  for (i in seq_along(cols_no_var)) {
+    ft <- flextable::set_header_labels(
+      ft,
+      .labels = stats::setNames(lower_labels[i], cols_no_var[i])
+    )
+  }
+  
+  # top header row (model titles)
+  ft <- flextable::add_header_row(
+    ft,
+    values    = c(stringr::str_to_title(dv), grp_rle$values),
+    colwidths = c(1, grp_rle$lengths)
+  )
+  ft <- flextable::merge_h(ft, part = "header")
+  
+  # remove redundant second header row
+  ft <- flextable::delete_rows(ft, i = 2, part = "header")
+  
+  # blank star-column headers
+  star_cols <- grep("_stars$", names(tab2))
+  ft <- flextable::set_header_labels(
+    ft,
+    values = setNames(rep("", length(star_cols)), names(tab2)[star_cols])
+  )
+  
+  # replace top-left header cell
+  ft <- flextable::set_header_labels(
+    ft,
+    values = c(Variable = "Term")
+  )
+
+  # ---- Alignment ----
+  ft <- flextable::align(ft, j = 1,  align = "left",   part = "all")
+  ft <- flextable::align(ft, j = -1, align = "center", part = "all")
+  ft <- flextable::valign(ft,        val   = "center", part = "all")
+
+  # ---- FIXED LAYOUT (prevents Word reflow) ----
+  ft <- flextable::set_table_properties(
+    ft,
+    layout = "fixed",
+    width  = 1
+  )
+
+  # ---- Font defaults ----
+  ft <- flextable::font(ft, fontname = "Times New Roman", part = "all")
+  ft <- flextable::fontsize(ft, size = 10, part = "all")
+
+  # ---- Padding ----
+  ft <- flextable::padding(ft, padding = 2, part = "all")
+
+  # ---- Column widths (MATCH clustered logit + multinomial) ----
+  ft <- flextable::width(ft, j = 1,          width = 1.40)  # Variable
+  ft <- flextable::width(ft, j = coef_cols,  width = 0.85)  # Coef(SE)
+  ft <- flextable::width(ft, j = stars_cols, width = 0.35)  # Sig.
+
+  # ---- Rules ----
+  thin <- officer::fp_border(color = "#999999", width = 0.75)
+  ft <- flextable::border_remove(ft)
+  ft <- flextable::hline_top(ft,    border = thin, part = "header")
+  ft <- flextable::hline_bottom(ft, border = thin, part = "header")
+  ft <- flextable::hline_bottom(ft, border = thin, part = "body")
+  ft <- flextable::bold(ft, part = "header")
+
+  ft
+}
+
+```
+
+```{r Model Doc Creation | Gun Ownership | Unweighted}
+# Choose DV (from allowed_binary_dvs list)
+dv <- "gun_own"
+
+# filter data
+matched_data <- make_matched_sample(
+  dv = dv,
+  data = dat_all_processed,
+  individual_controls = individual_controls,
+  state_sets = state_sets
+)
+
+message("Fitting mixed-effects models for DV = ", dv)
+assembled <- assemble_table_for_dv(dv, matched_data)
+tab <- assembled$table
+mods <- assembled$models
+
+# Rename columns to "Variable", then "<label>_coef_se", "<label>_stars"
+#    using the model names we actually have (Base, Ind., set1..)
+stopifnot(ncol(tab) > 0)
+k <- length(mods)
+model_labels <- names(mods)
+new_names <- c("Variable", as.vector(rbind(
+  paste0(model_labels, "_coef_se"),
+  paste0(model_labels, "_stars")
+)))
+names(tab) <- new_names
+
+# Footer with state variance, N, and AIC (for each model)
+gl_list <- lapply(mods, function(m) {
+  gl <- tryCatch(broom.mixed::glance(m), error = function(e) NULL)
+  vc <- tryCatch(as.data.frame(VarCorr(m)), error = function(e) NULL)
+  state_var <- if (!is.null(vc)) vc$vcov[vc$grp == "state"] else NA
+  c(
+    StateVar = state_var,
+    N   = if (!is.null(gl) && !is.null(gl$nobs)) gl$nobs else nobs(m),
+    AIC = if (!is.null(gl) && !is.null(gl$AIC))  gl$AIC  else AIC(m)
+  )
+})
+gl_df <- do.call(rbind, gl_list)
+
+footer_rows <- list()
+for (stat_name in c("State variance", "AIC")) {
+  row <- setNames(as.list(rep("", length(new_names))), new_names)
+  row$Variable <- stat_name
+  for (j in seq_len(k)) {
+    val <- gl_df[j, switch(stat_name,
+                           "State variance" = "StateVar",
+                           "AIC"            = "AIC")]
+    row[[ paste0(model_labels[j], "_coef_se") ]] <-
+      if (stat_name == "AIC") formatC(as.numeric(val), format = "f", digits = 1)
+      else if (stat_name == "State variance") formatC(as.numeric(val), format = "f", digits = 3)
+    row[[ paste0(model_labels[j], "_stars") ]] <- ""
+  }
+  footer_rows[[length(footer_rows) + 1]] <- as.data.frame(row, check.names = FALSE)
+}
+footer <- bind_rows(footer_rows)
+
+tab2 <- bind_rows(tab, footer)
+tab2[is.na(tab2)] <- ""
+
+# Build flextable & export to Word
+ft <- build_flextable_for_dv(dv, tab2)
+
+doc_path <- paste0("output/models_permit_", dv, "_mixed.docx")
+doc <- officer::read_docx()
+doc <- officer::body_add_par(doc, stringr::str_to_title(dv), style = "heading 1")
+doc <- flextable::body_add_flextable(doc, ft)
+print(doc, target = doc_path)
+message("Wrote: ", doc_path)
+
+# Play Lindsey Buckingham saying "organic" when the document is done
+play(load.wave("Organic.wav"))
+```
+
+```{r Model Doc Creation | Gun in Home | Unweighted}
+# Choose DV (from allowed_binary_dvs list)
+dv <- "gun_home"
+
+# filter data
+matched_data <- make_matched_sample(
+  dv = dv,
+  data = dat_all_processed,
+  individual_controls = individual_controls,
+  state_sets = state_sets
+)
+
+message("Fitting mixed-effects models for DV = ", dv)
+assembled <- assemble_table_for_dv(dv, matched_data)
+tab <- assembled$table
+mods <- assembled$models
+
+# Rename columns to "Variable", then "<label>_coef_se", "<label>_stars"
+# using the model names we actually have (Base, Ind., set1..)
+stopifnot(ncol(tab) > 0)
+k <- length(mods)
+model_labels <- names(mods)
+new_names <- c("Variable", as.vector(rbind(
+  paste0(model_labels, "_coef_se"),
+  paste0(model_labels, "_stars")
+)))
+names(tab) <- new_names
+
+# Footer with state variance, N, and AIC (for each model)
+gl_list <- lapply(mods, function(m) {
+  gl <- tryCatch(broom.mixed::glance(m), error = function(e) NULL)
+  vc <- tryCatch(as.data.frame(VarCorr(m)), error = function(e) NULL)
+  state_var <- if (!is.null(vc)) vc$vcov[vc$grp == "state"] else NA
+  c(
+    StateVar = state_var,
+    N   = if (!is.null(gl) && !is.null(gl$nobs)) gl$nobs else nobs(m),
+    AIC = if (!is.null(gl) && !is.null(gl$AIC))  gl$AIC  else AIC(m)
+  )
+})
+gl_df <- do.call(rbind, gl_list)
+
+footer_rows <- list()
+for (stat_name in c("State variance", "AIC")) {
+  row <- setNames(as.list(rep("", length(new_names))), new_names)
+  row$Variable <- stat_name
+  for (j in seq_len(k)) {
+    val <- gl_df[j, switch(stat_name,
+                           "State variance" = "StateVar",
+                           "AIC"            = "AIC")]
+    row[[ paste0(model_labels[j], "_coef_se") ]] <-
+      if (stat_name == "AIC") formatC(as.numeric(val), format = "f", digits = 1)
+      else if (stat_name == "State variance") formatC(as.numeric(val), format = "f", digits = 3)
+    row[[ paste0(model_labels[j], "_stars") ]] <- ""
+  }
+  footer_rows[[length(footer_rows) + 1]] <- as.data.frame(row, check.names = FALSE)
+}
+footer <- bind_rows(footer_rows)
+
+tab2 <- bind_rows(tab, footer)
+tab2[is.na(tab2)] <- ""
+
+# Build flextable & export to Word
+ft <- build_flextable_for_dv(dv, tab2)
+
+doc_path <- paste0("output/models_permit_", dv, "_mixed.docx")
+doc <- officer::read_docx()
+doc <- officer::body_add_par(doc, stringr::str_to_title(dv), style = "heading 1")
+doc <- flextable::body_add_flextable(doc, ft)
+print(doc, target = doc_path)
+message("Wrote: ", doc_path)
+
+# Play Lindsey Buckingham saying "organic" when the document is done
+play(load.wave("Organic.wav"))
+```
+
+```{r Model Doc Creation | Carry | Unweighted | Gun Owners}
+# Choose DV (from allowed_binary_dvs list)
+dv <- "carry"
+
+# filter data
+matched_data <- make_matched_sample(
+  dv = dv,
+  data = dat_gunowners_processed,
+  individual_controls = individual_controls,
+  state_sets = state_sets
+)
+
+message("Fitting mixed-effects models for DV = ", dv)
+assembled <- assemble_table_for_dv(dv, matched_data)
+tab <- assembled$table
+mods <- assembled$models
+
+# Rename columns to "Variable", then "<label>_coef_se", "<label>_stars"
+# using the model names we actually have (Base, Ind., set1..)
+stopifnot(ncol(tab) > 0)
+k <- length(mods)
+model_labels <- names(mods)
+new_names <- c("Variable", as.vector(rbind(
+  paste0(model_labels, "_coef_se"),
+  paste0(model_labels, "_stars")
+)))
+names(tab) <- new_names
+
+# Footer with state variance, N, and AIC (for each model)
+gl_list <- lapply(mods, function(m) {
+  gl <- tryCatch(broom.mixed::glance(m), error = function(e) NULL)
+  vc <- tryCatch(as.data.frame(VarCorr(m)), error = function(e) NULL)
+  state_var <- if (!is.null(vc)) vc$vcov[vc$grp == "state"] else NA
+  c(
+    StateVar = state_var,
+    N   = if (!is.null(gl) && !is.null(gl$nobs)) gl$nobs else nobs(m),
+    AIC = if (!is.null(gl) && !is.null(gl$AIC))  gl$AIC  else AIC(m)
+  )
+})
+gl_df <- do.call(rbind, gl_list)
+
+footer_rows <- list()
+for (stat_name in c("State variance", "AIC")) {
+  row <- setNames(as.list(rep("", length(new_names))), new_names)
+  row$Variable <- stat_name
+  for (j in seq_len(k)) {
+    val <- gl_df[j, switch(stat_name,
+                           "State variance" = "StateVar",
+                           "AIC"            = "AIC")]
+    row[[ paste0(model_labels[j], "_coef_se") ]] <-
+      if (stat_name == "AIC") formatC(as.numeric(val), format = "f", digits = 1)
+      else if (stat_name == "State variance") formatC(as.numeric(val), format = "f", digits = 3)
+    row[[ paste0(model_labels[j], "_stars") ]] <- ""
+  }
+  footer_rows[[length(footer_rows) + 1]] <- as.data.frame(row, check.names = FALSE)
+}
+footer <- bind_rows(footer_rows)
+
+tab2 <- bind_rows(tab, footer)
+tab2[is.na(tab2)] <- ""
+
+# Build flextable & export to Word
+ft <- build_flextable_for_dv(dv, tab2)
+
+doc_path <- paste0("output/models_permit_", dv, "_mixed.docx")
+doc <- officer::read_docx()
+doc <- officer::body_add_par(doc, stringr::str_to_title(dv), style = "heading 1")
+doc <- flextable::body_add_flextable(doc, ft)
+print(doc, target = doc_path)
+message("Wrote: ", doc_path)
+
+# Play Lindsey Buckingham saying "organic" when the document is done
+play(load.wave("Organic.wav"))
+```
+
+```{r Model Doc Creation | Open Carry | Unweighted | Gun Owners}
+# Choose DV (from allowed_binary_dvs list)
+dv <- "open_carry"
+
+# filter data
+matched_data <- make_matched_sample(
+  dv = dv,
+  data = dat_gunowners_processed,
+  individual_controls = individual_controls,
+  state_sets = state_sets
+)
+
+message("Fitting mixed-effects models for DV = ", dv)
+assembled <- assemble_table_for_dv(dv, matched_data)
+tab <- assembled$table
+mods <- assembled$models
+
+# Rename columns to "Variable", then "<label>_coef_se", "<label>_stars"
+# using the model names we actually have (Base, Ind., set1..)
+stopifnot(ncol(tab) > 0)
+k <- length(mods)
+model_labels <- names(mods)
+new_names <- c("Variable", as.vector(rbind(
+  paste0(model_labels, "_coef_se"),
+  paste0(model_labels, "_stars")
+)))
+names(tab) <- new_names
+
+# Footer with state variance, N, and AIC (for each model)
+gl_list <- lapply(mods, function(m) {
+  gl <- tryCatch(broom.mixed::glance(m), error = function(e) NULL)
+  vc <- tryCatch(as.data.frame(VarCorr(m)), error = function(e) NULL)
+  state_var <- if (!is.null(vc)) vc$vcov[vc$grp == "state"] else NA
+  c(
+    StateVar = state_var,
+    N   = if (!is.null(gl) && !is.null(gl$nobs)) gl$nobs else nobs(m),
+    AIC = if (!is.null(gl) && !is.null(gl$AIC))  gl$AIC  else AIC(m)
+  )
+})
+gl_df <- do.call(rbind, gl_list)
+
+footer_rows <- list()
+for (stat_name in c("State variance", "AIC")) {
+  row <- setNames(as.list(rep("", length(new_names))), new_names)
+  row$Variable <- stat_name
+  for (j in seq_len(k)) {
+    val <- gl_df[j, switch(stat_name,
+                           "State variance" = "StateVar",
+                           "AIC"            = "AIC")]
+    row[[ paste0(model_labels[j], "_coef_se") ]] <-
+      if (stat_name == "AIC") formatC(as.numeric(val), format = "f", digits = 1)
+      else if (stat_name == "State variance") formatC(as.numeric(val), format = "f", digits = 3)
+    row[[ paste0(model_labels[j], "_stars") ]] <- ""
+  }
+  footer_rows[[length(footer_rows) + 1]] <- as.data.frame(row, check.names = FALSE)
+}
+footer <- bind_rows(footer_rows)
+
+tab2 <- bind_rows(tab, footer)
+tab2[is.na(tab2)] <- ""
+
+# Build flextable & export to Word
+ft <- build_flextable_for_dv(dv, tab2)
+
+doc_path <- paste0("output/models_permit_", dv, "_mixed.docx")
+doc <- officer::read_docx()
+doc <- officer::body_add_par(doc, stringr::str_to_title(dv), style = "heading 1")
+doc <- flextable::body_add_flextable(doc, ft)
+print(doc, target = doc_path)
+message("Wrote: ", doc_path)
+
+# Play Lindsey Buckingham saying "organic" when the document is done
+play(load.wave("Organic.wav"))
+```
+
+```{r Model Doc Creation | Purchase Plan | Unweighted | Controlling for gun ownership}
+
+#### Use gun ownership variants from shared specs ####
+individual_controls <- paste(control_vars_gunown, collapse = " + ")
+var_labels <- var_labels_gunown
+
+# Choose DV (from allowed_binary_dvs list)
+dv <- "purchase_plan"
+
+# filter data
+matched_data <- make_matched_sample(
+  dv = dv,
+  data = dat_all_processed,
+  individual_controls = individual_controls,
+  state_sets = state_sets
+)
+
+message("Fitting mixed-effects models for DV = ", dv)
+assembled <- assemble_table_for_dv(dv, matched_data)
+tab <- assembled$table
+mods <- assembled$models
+
+# 2) Rename columns to "Variable", then "<label>_coef_se", "<label>_stars"
+#    using the model names we actually have (Base, Ind., set1..)
+stopifnot(ncol(tab) > 0)
+k <- length(mods)
+model_labels <- names(mods)
+new_names <- c("Variable", as.vector(rbind(
+  paste0(model_labels, "_coef_se"),
+  paste0(model_labels, "_stars")
+)))
+names(tab) <- new_names
+
+# 3) Footer with state variance, N, and AIC (for each model)
+gl_list <- lapply(mods, function(m) {
+  gl <- tryCatch(broom.mixed::glance(m), error = function(e) NULL)
+  vc <- tryCatch(as.data.frame(VarCorr(m)), error = function(e) NULL)
+  state_var <- if (!is.null(vc)) vc$vcov[vc$grp == "state"] else NA
+  c(
+    StateVar = state_var,
+    N   = if (!is.null(gl) && !is.null(gl$nobs)) gl$nobs else nobs(m),
+    AIC = if (!is.null(gl) && !is.null(gl$AIC))  gl$AIC  else AIC(m)
+  )
+})
+gl_df <- do.call(rbind, gl_list)
+
+footer_rows <- list()
+for (stat_name in c("State variance", "AIC")) {
+  row <- setNames(as.list(rep("", length(new_names))), new_names)
+  row$Variable <- stat_name
+  for (j in seq_len(k)) {
+    val <- gl_df[j, switch(stat_name,
+                           "State variance" = "StateVar",
+                           "AIC"            = "AIC")]
+    row[[ paste0(model_labels[j], "_coef_se") ]] <-
+      if (stat_name == "AIC") formatC(as.numeric(val), format = "f", digits = 1)
+      else if (stat_name == "State variance") formatC(as.numeric(val), format = "f", digits = 3)
+    row[[ paste0(model_labels[j], "_stars") ]] <- ""
+  }
+  footer_rows[[length(footer_rows) + 1]] <- as.data.frame(row, check.names = FALSE)
+}
+footer <- bind_rows(footer_rows)
+
+tab2 <- bind_rows(tab, footer)
+tab2[is.na(tab2)] <- ""
+
+# 4) Build flextable & export to Word
+ft <- build_flextable_for_dv(dv, tab2)
+
+doc_path <- paste0("output/models_permit_", dv, "_mixed.docx")
+doc <- officer::read_docx()
+doc <- officer::body_add_par(doc, stringr::str_to_title(dv), style = "heading 1")
+doc <- flextable::body_add_flextable(doc, ft)
+print(doc, target = doc_path)
+message("Wrote: ", doc_path)
+
+# Play Lindsey Buckingham saying "organic" when the document is done
+play(load.wave("Organic.wav"))
+```
+
+```{r See a given model}
+assembled <- assemble_table_for_dv("gun_own", matched_data)
+mods <- assembled$models
+names(mods)
+# [1] "Base (RI only)" "Ind. controls" "set1" "set2" "set3" "set4" "set5"
+
+# RENAME MODELS FROM NAMES
+m1 <- mods[["set4"]]
+m2  <- mods[["Ind. controls"]]
+
+summary(m1)        # fixed effects, z, p; random-intercept SD
+lme4::fixef(m1)    # fixed effects only
+lme4::ranef(m1)    # random effects (BLUPs) by state
+lme4::VarCorr(m1)  # random-effects variance/covariance
+AIC(m1); nobs(m1)  # fit stats
+
+# ORs for all fixed effects
+exp(lme4::fixef(m1))
+
+# 95% CI for ORs (Wald)
+coefs <- lme4::fixef(m1)
+ses   <- sqrt(diag(vcov(m1)))
+OR    <- exp(coefs)
+lo    <- exp(coefs - 1.96 * ses)
+hi    <- exp(coefs + 1.96 * ses)
+cbind(OR, lo, hi)
+
+# fixed effects with OR and an approximate SE(OR)
+broom.mixed::tidy(m1, effects = "fixed") |>
+  dplyr::mutate(OR = exp(estimate),
+                se_or = OR * std.error)
+
+# one-row model summary (AIC, nobs, etc.)
+broom.mixed::glance(m1)
+
+# compare model fit
+AIC(m1, m2)               # smaller = better (penalized for complexity)
+anova(m1, m2, test = "Chisq")  # LR test (nested models)
+```

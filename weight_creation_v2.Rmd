@@ -1,0 +1,974 @@
+---
+output: console
+---
+
+Weight Creation Script
+ACS 2024
+Variables:
+- Numeric: gender_num, age_num, educ_num, inc5_num, pid3_num, race_eth_reg_num
+- Factor: gender_cat, age_cat, educ_cat, inc5_cat, pid3_cat, race_eth_reg_cat
+
+```{r Notes}
+
+# Worth noting that the weighting here we are doing is on an op-in panel. This isn't a deal where we're weighting to correct for sampling probabilities. We have no sampling frame because we have no idea why any given person ended up in the sample. We're essentially weighting as an act of faith to make it closer to something representative of the true population
+
+# Reasoning behind the raking variables:
+  # Gender, age, education are typical raking vars.
+  # Income - opt-in panels tend to skew more middle-income, and potentially relevant for outcomes
+  # Race x Region is more precise to the racial imbalances across the country and is theorized to be important especially in terms of gun culture
+  # PID is relevant to the outcomes of interest—only problematic if the lurking variable that leads to under/over-representation of certain political groups also affects our outcomes of interest
+
+# Can't correct for the fact that people in opt-in panels likely differ from the general population in important ways
+
+# Notes with a bit more info that I didn't want to write down from Claude:
+# RAKING OVERVIEW
+
+# Raking (iterative proportional fitting) adjusts each respondent's weight so
+# that the weighted sample matches known population targets on each variable
+# margin. It works by cycling through variables one at a time, rescaling
+# weights to hit each target, and repeating until all margins converge.
+#
+# We rake on six variables:
+#   - Gender, age, education, income, race x region: standard demographic
+#     corrections for the known biases of opt-in online panels like Lucid,
+#     which tend to skew higher-education, middle-income, and regionally
+#     unrepresentative
+#   - Party ID: included because partisan composition strongly predicts
+#     attitudes toward political violence -- the primary outcome of interest --
+#     so an imbalanced sample on PID would directly bias key estimates.
+#     The tradeoff is that PID is not a stable demographic characteristic;
+#     if the selection process that causes certain partisan groups to be
+#     over/underrepresented in Lucid is itself related to political violence
+#     attitudes beyond what PID captures, raking on PID corrects the surface
+#     imbalance but not the underlying selection bias. On balance, inclusion
+#     is preferable given how strongly partisan our outcomes are.
+#   - Race x region interaction rather than race and region separately:
+#     racial composition varies dramatically by region (e.g., the South is
+#     heavily Black, the West heavily Hispanic). Raking on independent margins
+#     can produce a sample that hits both marginals but still misrepresents
+#     Black Southerners or Hispanic Westerners. The interaction forces the
+#     joint distribution to match the population.
+#
+# WHEN RAKING ON A VARIABLE IS PROBLEMATIC:
+#   Raking assumes the variable is a stable population characteristic with
+#   known targets and that any over/underrepresentation is incidental to the
+#   sampling process rather than related to your outcomes. PID is the main
+#   case where this assumption is debatable (see above). You would NOT want
+#   to rake on an outcome variable or a variable causally downstream of your
+#   outcomes -- that would introduce bias rather than reduce it.
+```
+
+```{r Load packages}
+# Library setup
+library(data.table) # For fread() -- query a CSV directly without loading it into memory
+library(survey) # For survey::rake
+library(tidyverse) # I rely on the %>% operator from {tidyverse}
+```
+
+```{r Load acs data, eval=FALSE}
+# # Originally used ACS PUMS to derive population targets, but the files are huge and it takes a lot of memory so can skip to the chunks below
+# # We get the pid and income estimates from other sources anyway
+# 
+# # Census data is huge, so selectively read in the variables we need
+# a <- fread(
+#   "~/Library/CloudStorage/GoogleDrive-pauleteas@gmail.com/My Drive/Research/PROJECTS/Bedrock/weight_creation/csv_pus/psam_pusa.csv",
+#   select = c("HISP", "AGEP", "REGION", "RAC1P", "SCHL", "SEX", "PWGTP")
+# )
+# b <- fread(
+#   "~/Library/CloudStorage/GoogleDrive-pauleteas@gmail.com/My Drive/Research/PROJECTS/Bedrock/weight_creation/csv_pus/psam_pusb.csv",
+#   select = c("HISP", "AGEP", "REGION", "RAC1P", "SCHL", "SEX", "PWGTP")
+# )
+# 
+# # Combine the csvs
+# acs <- rbind(a, b)
+# rm(a, b) # Clear the individual objects to save on memory
+# acs <- subset(acs, acs$AGEP > 17) # restrict data to adults
+# head(acs)
+# 
+# summary(acs$PWGTP) # This is the weights that ACS uses
+# # normal to have giant range for these because it's weighted to represent literally the whole population, not a sample of the population. So like on average, each participant represents 96 American adults
+# 
+# # Recode ACS variables to match survey coding
+# acs$hispanic[acs$HISP != 1] <- 1  # Hispanic
+# acs$hispanic[acs$HISP == 1] <- 2  # Non-Hispanic
+# 
+# acs$sex[acs$SEX == 1] <- 1 # Male
+# acs$sex[acs$SEX == 2] <- 2 # Female
+# 
+# acs$region[acs$REGION == 1] <- 1 # Northeast
+# acs$region[acs$REGION == 2] <- 2 # Midwest
+# acs$region[acs$REGION == 3] <- 3 # South
+# acs$region[acs$REGION == 4] <- 4 # West
+# 
+# acs$age4[acs$AGEP < 30] <- 1  # 18-29
+# acs$age4[acs$AGEP >= 30 & acs$AGEP < 45] <- 2  # 30-44
+# acs$age4[acs$AGEP >= 45 & acs$AGEP < 65] <- 3  # 45-64
+# acs$age4[acs$AGEP >= 65] <- 4  # 65+
+# 
+# acs$educ4[acs$SCHL <= 17] <- 1 # HS or less (includes GED)
+# acs$educ4[acs$SCHL >= 18 & acs$SCHL <= 20] <- 2 # Some college + Associate's
+# acs$educ4[acs$SCHL == 21] <- 3 # Bachelor's degree
+# acs$educ4[acs$SCHL >= 22] <- 4 # Graduate degree
+# 
+# acs$race4 <- 4  # Other (default)
+# acs$race4[acs$RAC1P == 1 & acs$hispanic == 2] <- 1  # White non-Hispanic
+# acs$race4[acs$RAC1P == 2 & acs$hispanic == 2] <- 2  # Black non-Hispanic
+# acs$race4[acs$hispanic == 1] <- 3  # Hispanic (any race)
+# 
+# # Race x Region interaction
+# acs$race_eth_reg <- acs$race4 + (acs$region - 1) * 4
+# 
+# # Create labeled factor versions for clarity
+# # _num = numeric (sex, age4, etc.), _cat = factors with labels
+# acs <- acs %>%
+#   dplyr::mutate(
+#     sex_cat = factor(sex, levels = 1:2, labels = c("Male", "Female")),
+#     age4_cat = factor(age4, levels = 1:4, labels = c("18-29", "30-44", "45-64", "65+")),
+#     educ4_cat = factor(educ4, levels = 1:4, labels = c("HS or less", "Some college", "College", "Graduate")),
+#     race4_cat = factor(race4, levels = 1:4, labels = c("White", "Black", "Hispanic", "Other")),
+#     region_cat = factor(region, levels = 1:4, labels = c("Northeast", "Midwest", "South", "West")),
+#     race_eth_reg_cat = factor(race_eth_reg, levels = 1:16,
+#             labels = c("NE White", "NE Black", "NE Hispanic", "NE Other",
+#                        "MW White", "MW Black", "MW Hispanic", "MW Other",
+#                        "S White", "S Black", "S Hispanic", "S Other",
+#                        "W White", "W Black", "W Hispanic", "W Other"))
+#   )
+```
+
+```{r Calculate acs targets, eval=FALSE}
+# # Calculate weighted population proportions from ACS using PWGTP
+# # These become our "target" proportions for raking
+# # Using labeled factors for easier interpretation
+# 
+# # Gender targets
+# acs %>%
+#   filter(!is.na(sex_cat)) %>%
+#   group_by(sex_cat) %>%
+#   summarise(weighted_n = sum(PWGTP, na.rm = TRUE)) %>%
+#   mutate(prop = weighted_n / sum(weighted_n) * 100)
+# 
+# # Age targets (4 categories)
+# acs %>%
+#   filter(!is.na(age4_cat)) %>%
+#   group_by(age4_cat) %>%
+#   summarise(weighted_n = sum(PWGTP, na.rm = TRUE)) %>%
+#   mutate(prop = weighted_n / sum(weighted_n) * 100)
+# 
+# # Race targets (4 categories)
+# acs %>%
+#   filter(!is.na(race4_cat)) %>%
+#   group_by(race4_cat) %>%
+#   summarise(weighted_n = sum(PWGTP, na.rm = TRUE)) %>%
+#   mutate(prop = weighted_n / sum(weighted_n) * 100)
+# 
+# # Education targets (4 categories)
+# acs %>%
+#   filter(!is.na(educ4_cat)) %>%
+#   group_by(educ4_cat) %>%
+#   summarise(weighted_n = sum(PWGTP, na.rm = TRUE)) %>%
+#   mutate(prop = weighted_n / sum(weighted_n) * 100)
+# 
+# # Region targets
+# acs %>%
+#   filter(!is.na(region_cat)) %>%
+#   group_by(region_cat) %>%
+#   summarise(weighted_n = sum(PWGTP, na.rm = TRUE)) %>%
+#   mutate(prop = weighted_n / sum(weighted_n) * 100)
+# 
+# # Race x Region targets (16 categories)
+# acs %>%
+#   filter(!is.na(race_eth_reg_cat)) %>%
+#   group_by(race_eth_reg_cat) %>%
+#   summarise(weighted_n = sum(PWGTP, na.rm = TRUE)) %>%
+#   mutate(prop = weighted_n / sum(weighted_n) * 100)
+# 
+# rm(acs) # Clear ACS to save memory
+```
+
+```{r Calculate income targets from Census table}
+# NOTE: Income is NOT available in the ACS PUMS raw data files we used above.
+# Instead, we calculate income distribution targets from the Census Bureau's
+# Current Population Survey (CPS) HINC-06 table: "Income Distribution to $250,000 or More for Households"
+# Source: https://www.census.gov/data/tables/2025/demo/cps/hinc-06.html
+# Data file: income.csv (extracted from HINC-06 table for 2024)
+
+# Read the Census income distribution table
+income <- read.csv("income.csv", header = FALSE, stringsAsFactors = FALSE)
+names(income) <- c("bracket", "households")
+
+# Clean the data - remove commas and convert to numeric
+income$households <- as.numeric(gsub(",", "", income$households))
+
+# Get total households (first row)
+total <- income$households[1]
+total
+head(income)
+
+# Calculate counts for each of our 5 income categories
+# Up to $29,999 (rows 2-7): Under $5k through $25-30k
+under_30k <- sum(income$households[2:7])
+
+# $30,000-$59,999 (rows 8-13): $30-35k through $55-60k
+inc_30_60k <- sum(income$households[8:13])
+
+# $60,000-$99,999 (rows 14-21): $60-65k through $95-100k
+inc_60_100k <- sum(income$households[14:21])
+
+# $100,000-$149,999 (rows 22-31): $100-105k through $145-150k
+inc_100_150k <- sum(income$households[22:31])
+
+# $150,000+ (rows 32-43): $150-155k through $250k+
+inc_150k_plus <- sum(income$households[32:43])
+
+# Calculate percentages
+round((under_30k / total) * 100, 1)
+round((inc_30_60k / total) * 100, 1)
+round((inc_60_100k / total) * 100, 1)
+round((inc_100_150k / total) * 100, 1)
+round((inc_150k_plus / total) * 100, 1)
+```
+
+```{r Define targets}
+# Using text labels that match our factor levels for clarity
+target_gender <- c(
+  "Male" = 49.0,
+  "Female" = 51.0
+)
+
+target_age <- c(
+  "18-29" = 20.0,
+  "30-44" = 26.2,
+  "45-64" = 30.9,
+  "65+" = 22.9
+)
+
+target_educ <- c(
+  "HS or less" = 37.3,
+  "Some college" = 28.5,
+  "College" = 21.0,
+  "Graduate" = 13.2
+)
+
+# income targets from Census CPS HINC-06 table
+target_inc5 <- c(
+  "Up to $29,999" = 16.8,
+  "$30,000-$59,999" = 19.6,
+  "$60,000-$99,999" = 20.8,
+  "$100,000-$149,999" = 16.7,
+  "$150,000+" = 26.1
+)
+
+# targets from Gallup 2024: https://news.gallup.com/poll/15370/party-affiliation.aspx
+target_pid3 <- c(
+  "Democrat" = 45,
+  "Independent" = 9,
+  "Republican" = 46
+)
+
+# Race x Region interaction (16 categories)
+target_race_eth_reg <- c(
+  "NE White" = 10.9,
+  "NE Black" = 1.78,
+  "NE Hispanic" = 2.56,
+  "NE Other" = 2.04,
+  "MW White" = 15.1,
+  "MW Black" = 1.92,
+  "MW Hispanic" = 1.69,
+  "MW Other" = 1.65,
+  "S White" = 21.4,
+  "S Black" = 6.82,
+  "S Hispanic" = 7.16,
+  "S Other" = 3.33,
+  "W White" = 11.5,
+  "W Black" = 1.02,
+  "W Hispanic" = 6.71,
+  "W Other" = 4.3
+)
+
+# Targets should sum to ~100
+sum(target_gender)
+sum(target_age)
+sum(target_educ)
+sum(target_inc5)
+sum(target_pid3)
+sum(target_race_eth_reg)
+```
+
+```{r Load survey data}
+dat <- read.csv(
+  "data/data_unweighted.csv",
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+# Remove non-Lucid data
+dat <- dat %>% filter(gc == 1)
+
+# checks
+nrow(dat)
+table(dat$region) # From Lucid/Cint
+table(dat$Q2) # Age
+table(dat$Q3) # Gender
+table(dat$Q4) # Hispanic
+table(dat$Q5) # Race
+table(dat$standard_education_us) # From Lucid/Cint
+table(dat$standard_hhi) # From Lucid/Cint
+table(dat$Q10) # Party ID
+table(dat$Q13) # Leaner question
+```
+
+```{r Recode survey data}
+# All starting variables are numeric/integers
+# Create _num variables for numeric values
+
+# Case ID
+dat <- dat %>%
+  dplyr::mutate(caseid = dplyr::row_number())
+
+# Gender (1 = Male, 2 = Female)
+# Q3 is 1=Female, 2=Male in survey, but need to flip to match ACS (1=Male, 2=Female)
+dat <- dat %>%
+  dplyr::mutate(
+    gender_num = dplyr::case_when(
+      Q3 == 1 ~ 2,  # Survey Female (1) -> ACS Female (2)
+      Q3 == 2 ~ 1,  # Survey Male (2) -> ACS Male (1)
+      TRUE ~ NA_real_
+    )
+  )
+table(dat$gender_num, useNA = "ifany")
+
+# Age (1 = 18-29, 2 = 30-44, 3 = 45-64, 4 = 65+)
+# Q2 is 2-5 in survey (1="under 18" was excluded), recode to 1-4
+dat <- dat %>%
+  dplyr::mutate(
+    age_num = dplyr::case_when(
+      Q2 == 2 ~ 1,  # 18-29
+      Q2 == 3 ~ 2,  # 30-44
+      Q2 == 4 ~ 3,  # 45-64
+      Q2 == 5 ~ 4,  # 65+
+      TRUE ~ NA_real_
+    )
+  )
+table(dat$age_num, useNA = "ifany")
+
+# Race4 (1 = White non-Hispanic, 2 = Black non-Hispanic, 3 = Hispanic, 4 = Other)
+# Q4 is Hispanic indicator, Q5 is race
+# Need to create race_num based on numeric Q4 and Q5
+dat <- dat %>%
+  dplyr::mutate(
+    Q4_num = as.numeric(Q4),
+    Q5_num = as.numeric(Q5),
+    race_num = dplyr::case_when(
+      Q4_num == 1 ~ 3, # Hispanic (1 = Yes)
+      Q4_num == 2 & Q5_num == 1 ~ 1, # White non-Hispanic (2 = No, 1 = White)
+      Q4_num == 2 & Q5_num == 2 ~ 2, # Black non-Hispanic (2 = Black)
+      Q4_num == 2 ~ 4, # Other non-Hispanic
+      TRUE ~ NA_real_
+    )
+  )
+table(dat$race_num, useNA = "ifany")
+
+# Education (1 = HS or less, 2 = Some college, 3 = College, 4 = Grad)
+# standard_education_us is already numeric
+dat <- dat %>%
+  dplyr::mutate(
+    edu_num = as.numeric(standard_education_us),
+    educ_num = dplyr::case_when(
+      edu_num %in% c(1, 2) ~ 1, # HS or less
+      edu_num %in% c(3, 4, 5) ~ 2, # Some college + Associate's
+      edu_num == 6 ~ 3, # Bachelor's
+      edu_num %in% c(7, 8) ~ 4, # Graduate
+      TRUE ~ NA_real_
+    )
+  )
+table(dat$educ_num, useNA = "ifany")
+
+# Region (1 = NE, 2 = MW, 3 = S, 4 = W)
+# region is already numeric (1, 2, 3, 4)
+dat <- dat %>%
+  dplyr::mutate(
+    region_num = as.numeric(region)
+  )
+table(dat$region_num, useNA = "ifany")
+
+# Income (5 categories)
+# standard_hhi is already numeric, create 5 categories
+dat <- dat %>%
+  dplyr::mutate(
+    standard_hhi_num = as.numeric(standard_hhi),
+    inc5_num = dplyr::case_when(
+      standard_hhi_num >= 1 & standard_hhi_num <= 4 ~ 1, # Up to $29,999
+      standard_hhi_num >= 5 & standard_hhi_num <= 10 ~ 2, # $30,000-$59,999
+      standard_hhi_num >= 11 & standard_hhi_num <= 18 ~ 3, # $60,000-$99,999
+      standard_hhi_num %in% c(19, 20) ~ 4, # $100,000-$149,999
+      standard_hhi_num >= 21 & standard_hhi_num <= 24 ~ 5, # $150,000+
+      TRUE ~ NA_real_
+    )
+  )
+table(dat$inc5_num, useNA = "ifany")
+
+# Party ID 3 categories (with leaners)
+# 1 = Democrat (including leaners), 2 = Independent, 3 = Republican (including leaners)
+# Q10 and Q13 are already numeric
+dat <- dat %>%
+  dplyr::mutate(
+    Q10_num = as.numeric(Q10),
+    Q13_num = as.numeric(Q13),
+    pid3_num = dplyr::case_when(
+      Q10_num == 1 ~ 1, # Democrat
+      Q13_num == 1 ~ 1, # Lean Democrat
+      Q13_num == 3 ~ 2, # True Independent
+      Q10_num == 2 ~ 3, # Republican
+      Q13_num == 2 ~ 3, # Lean Republican
+      TRUE ~ NA_real_
+    )
+  )
+table(dat$pid3_num, useNA = "ifany")
+
+# Race x Region interaction (16 categories)
+# 1-4 = NE (White, Black, Hispanic, Other)
+# 5-8 = MW (White, Black, Hispanic, Other)
+# 9-12 = S (White, Black, Hispanic, Other)
+# 13-16 = W (White, Black, Hispanic, Other)
+dat <- dat %>%
+  dplyr::mutate(
+    race_eth_reg_num = dplyr::case_when(
+      !is.na(race_num) & !is.na(region_num) ~ race_num + (region_num - 1) * 4,
+      TRUE ~ NA_real_
+    )
+  )
+table(dat$race_eth_reg_num, useNA = "ifany")
+```
+
+```{r Create factor variables for raking}
+# Create _cat factor variables with meaningful text labels
+# Keep the _num versions for other analyses
+dat <- dat %>%
+  dplyr::mutate(
+    # Gender with labels
+    gender_cat = factor(gender_num,
+              levels = 1:2,
+              labels = c("Male", "Female")),
+
+    # Age with labels
+    age_cat = factor(age_num,
+              levels = 1:4,
+              labels = c("18-29", "30-44", "45-64", "65+")),
+
+    # Education with labels
+    educ_cat = factor(educ_num,
+              levels = 1:4,
+              labels = c("HS or less", "Some college", "College", "Graduate")),
+
+    # Income with labels
+    inc5_cat = factor(inc5_num,
+              levels = 1:5,
+              labels = c("Up to $29,999", "$30,000-$59,999", "$60,000-$99,999",
+                               "$100,000-$149,999", "$150,000+")),
+
+    # Party ID with labels
+    pid3_cat = factor(pid3_num,
+              levels = 1:3,
+              labels = c("Democrat", "Independent", "Republican")),
+
+    # Race x Region with labels
+    race_eth_reg_cat = factor(race_eth_reg_num,
+              levels = 1:16,
+              labels = c("NE White", "NE Black", "NE Hispanic", "NE Other",
+                         "MW White", "MW Black", "MW Hispanic", "MW Other",
+                         "S White", "S Black", "S Hispanic", "S Other",
+                         "W White", "W Black", "W Hispanic", "W Other"))
+  )
+
+# Check factor levels with labels
+table(dat$gender_cat, useNA = "ifany")
+table(dat$age_cat, useNA = "ifany")
+table(dat$educ_cat, useNA = "ifany")
+table(dat$inc5_cat, useNA = "ifany")
+table(dat$pid3_cat, useNA = "ifany")
+table(dat$race_eth_reg_cat, useNA = "ifany")
+
+# Completeness check for raking vars
+dat <- dat %>%
+  dplyr::mutate(
+    rake_complete = !is.na(gender_num) &
+      !is.na(age_num) &
+      !is.na(educ_num) &
+      !is.na(inc5_num) &
+      !is.na(pid3_num) &
+      !is.na(race_eth_reg_num)
+  )
+
+table(dat$rake_complete, useNA = "ifany")
+nrow(dat)
+
+# Filter to complete cases for raking
+dat_complete <- dat %>% filter(rake_complete == TRUE)
+nrow(dat_complete)
+```
+
+```{r Run survey rake}
+# Create population margin data frames for survey::rake
+# survey::rake needs data frames with the variable name and Freq column
+# This is how many of each demographic category we'd expect to see in our sample if it was perfectly representative of the US population on that demographic
+
+n <- nrow(dat_complete)
+
+pop_gender <- data.frame(
+  gender_cat = factor(names(target_gender), levels = levels(dat_complete$gender_cat)),
+  Freq = as.numeric(target_gender) / 100 * n
+)
+pop_gender
+
+pop_age <- data.frame(
+  age_cat = factor(names(target_age), levels = levels(dat_complete$age_cat)),
+  Freq = as.numeric(target_age) / 100 * n
+)
+
+pop_educ <- data.frame(
+  educ_cat = factor(names(target_educ), levels = levels(dat_complete$educ_cat)),
+  Freq = as.numeric(target_educ) / 100 * n
+)
+
+pop_inc5 <- data.frame(
+  inc5_cat = factor(names(target_inc5), levels = levels(dat_complete$inc5_cat)),
+  Freq = as.numeric(target_inc5) / 100 * n
+)
+
+pop_pid3 <- data.frame(
+  pid3_cat = factor(names(target_pid3), levels = levels(dat_complete$pid3_cat)),
+  Freq = as.numeric(target_pid3) / 100 * n
+)
+
+pop_race_eth_reg <- data.frame(
+  race_eth_reg_cat = factor(names(target_race_eth_reg), levels = levels(dat_complete$race_eth_reg_cat)),
+  Freq = as.numeric(target_race_eth_reg) / 100 * n
+)
+
+# Create unweighted survey design
+unweighted_design <- svydesign(
+  ids = ~1,
+  data = dat_complete
+)
+
+# Rake the design
+raked_design <- rake(
+  design = unweighted_design,
+  sample.margins = list(
+    ~gender_cat,
+    ~age_cat,
+    ~educ_cat,
+    ~inc5_cat,
+    ~pid3_cat,
+    ~race_eth_reg_cat
+  ),
+  population.margins = list(
+    pop_gender,
+    pop_age,
+    pop_educ,
+    pop_inc5,
+    pop_pid3,
+    pop_race_eth_reg
+  ),
+  control = list(maxit = 100, epsilon = 1e-4)
+)
+
+# Extract weights
+dat_complete$wgtpi <- weights(raked_design)
+summary(dat_complete$wgtpi)
+hist(dat_complete$wgtpi, breaks = 50, main = "Distribution of Weights (wgtpi)")
+```
+
+```{r Trim weights}
+# Cap = 7, floor = 0.2: No need to trim more aggressively like political polling. We're less concerned about a single point estimate of who's ahead and more concerned about a bunch of regression coefficients across different outcomes. We're also raking on more variables than in political polling, so weights are naturally going to inflate more, especially with the race x region interaction.
+# A cap of 5 is more conservative, but 7 allows more correction for hard-to-reach demographic cells (e.g., young low-income Hispanic men in the South) without letting any single respondent dominate too heavily.
+
+# Apply weight trimming
+dat_complete <- dat_complete %>%
+  dplyr::mutate(
+    # Normalize to mean of 1 before trimming
+    wgtpi = wgtpi / mean(wgtpi),
+    # Cap at 7, floor at 0.2
+    # Cap chosen to match colleague's Stata implementation; allows correction
+    # for hard-to-reach demographic cells without any single respondent
+    # dominating weighted estimates. A cap of 5 is more conservative.
+    wgtpi = pmin(wgtpi, 7),
+    wgtpi = pmax(wgtpi, 0.2)
+    # Note: we do NOT re-normalize after trimming -- doing so would push
+    # trimmed-at-7 cases above the cap. Weights are already close to mean 1
+    # after the normalize-then-trim sequence.
+  )
+
+summary(dat_complete$wgtpi)
+hist(dat_complete$wgtpi, breaks = 50, main = "Distribution of Weights (wgtpi)")
+
+# Had previously tried iterative rake-trimming, but variance increased rather than decreased with each iteration. We're fine with one raking run and then trimming after in this case though. See code for iterative rake-trimming below:
+
+# n_iter <- 3  # number of rake-trim cycles; 2-3 usually sufficient
+#
+# # Initialize equal weights before first iteration
+# dat_complete$wgtpi <- 1
+# 
+# for (i in 1:n_iter) {
+# 
+#   raked_design <- rake(
+#     design = svydesign(ids = ~1, data = dat_complete, weights = ~wgtpi),
+#     sample.margins = list(
+#       ~gender_cat, ~age_cat, ~educ_cat,
+#       ~inc5_cat, ~pid3_cat, ~race_eth_reg_cat
+#     ),
+#     population.margins = list(
+#       pop_gender, pop_age, pop_educ,
+#       pop_inc5, pop_pid3, pop_race_eth_reg
+#     ),
+#     control = list(maxit = 100, epsilon = 1e-4)
+#   )
+# 
+#   dat_complete$wgtpi <- weights(raked_design)
+#   dat_complete$wgtpi <- dat_complete$wgtpi / mean(dat_complete$wgtpi)
+# 
+#   dat_complete$wgtpi <- pmin(dat_complete$wgtpi, 7)
+#   dat_complete$wgtpi <- pmax(dat_complete$wgtpi, 0.2)
+# 
+#   cat(sprintf(
+#     "Iteration %d — min: %.3f  max: %.3f  mean: %.3f  sd: %.3f\n",
+#     i,
+#     min(dat_complete$wgtpi),
+#     max(dat_complete$wgtpi),
+#     mean(dat_complete$wgtpi),
+#     sd(dat_complete$wgtpi)
+#   ))
+# }
+```
+
+```{r Validate margins}
+# Validate weighted margins vs targets
+wprop <- function(x, w) {
+  xt <- xtabs(w ~ x)
+  as.numeric(xt) / sum(as.numeric(xt)) * 100
+}
+
+w_gender <- wprop(dat_complete$gender_num, dat_complete$wgtpi)
+print(data.frame(
+  category = c("Male", "Female"),
+  target = as.numeric(target_gender),
+  weighted = w_gender,
+  diff = w_gender - as.numeric(target_gender)
+))
+
+w_age <- wprop(dat_complete$age_num, dat_complete$wgtpi)
+print(data.frame(
+  category = c("18-29", "30-44", "45-64", "65+"),
+  target = as.numeric(target_age),
+  weighted = w_age,
+  diff = w_age - as.numeric(target_age)
+))
+
+w_educ <- wprop(dat_complete$educ_num, dat_complete$wgtpi)
+print(data.frame(
+  category = c("HS or less", "Some college", "College", "Graduate"),
+  target = as.numeric(target_educ),
+  weighted = w_educ,
+  diff = w_educ - as.numeric(target_educ)
+))
+
+w_inc5 <- wprop(dat_complete$inc5_num, dat_complete$wgtpi)
+print(data.frame(
+  category = c("<$30k", "$30-60k", "$60-100k", "$100-150k", "$150k+"),
+  target = as.numeric(target_inc5),
+  weighted = w_inc5,
+  diff = w_inc5 - as.numeric(target_inc5)
+))
+
+w_pid3 <- wprop(dat_complete$pid3_num, dat_complete$wgtpi)
+print(data.frame(
+  category = c("Democrat", "Independent", "Republican"),
+  target = as.numeric(target_pid3),
+  weighted = w_pid3,
+  diff = w_pid3 - as.numeric(target_pid3)
+))
+
+w_race_eth_reg <- wprop(dat_complete$race_eth_reg_num, dat_complete$wgtpi)
+race_eth_labels <- c(
+  "NE White", "NE Black", "NE Hispanic", "NE Other",
+  "MW White", "MW Black", "MW Hispanic", "MW Other",
+  "S White", "S Black", "S Hispanic", "S Other",
+  "W White", "W Black", "W Hispanic", "W Other"
+)
+print(data.frame(
+  category = race_eth_labels,
+  target = as.numeric(target_race_eth_reg),
+  weighted = w_race_eth_reg,
+  diff = w_race_eth_reg - as.numeric(target_race_eth_reg)
+))
+```
+
+```{r Merge and save}
+# Merge weights back to full dataset
+dat_final <- dat %>%
+  dplyr::left_join(
+    dat_complete %>% dplyr::select(caseid, wgtpi),
+    by = "caseid"
+  )
+
+nrow(dat_final)
+# Weighted N
+sum(!is.na(dat_final$wgtpi))
+# Unweighted N
+sum(is.na(dat_final$wgtpi))
+
+# Save the weighted data
+write.csv(dat_final, "data/data_weighted_r.csv", row.names = FALSE)
+```
+
+Comparison: Stata IPF vs. R survey::rake implementations
+```{r Compare Stata IPF vs R rake implementations}
+# Compares wgtpi from data_weighted_stata.csv (Stata IPF) vs dat_final (R survey::rake)
+
+# Load data
+stata_ipf <- read.csv("data/data_weighted_stata.csv", stringsAsFactors = FALSE)
+r_rake <- dat_final
+
+cat("Stata IPF N:           ", nrow(stata_ipf),                    "\n")
+cat("R rake N:              ", nrow(r_rake),                       "\n")
+cat("Stata IPF weighted N:  ", sum(!is.na(stata_ipf$wgtpi)),       "\n")
+cat("R rake weighted N:     ", sum(!is.na(r_rake$wgtpi)),          "\n")
+
+# Both Ns are the same, same people and same order. Can generate matching case IDs
+stata_ipf$caseid <- seq_len(nrow(stata_ipf))
+r_rake$caseid <- seq_len(nrow(r_rake))
+
+# Weight distribution
+cat("\n=== Weight Distribution ===\n")
+cat("\nStata IPF weights:\n");  print(summary(stata_ipf$wgtpi))
+cat("\nR rake weights:\n");     print(summary(r_rake$wgtpi))
+
+par(mfrow = c(1, 2))
+hist(stata_ipf$wgtpi, breaks = 50, main = "Stata IPF weights",  xlab = "wgtpi", col = "steelblue")
+hist(r_rake$wgtpi,    breaks = 50, main = "R rake weights",     xlab = "wgtpi", col = "coral")
+par(mfrow = c(1, 1))
+
+
+# Targets as coded in Stata IPF do-file (line 175)
+# ipfweight order: gender age educ inc5 pid3 race_eth_reg
+# NOTE: Stata IPF targets differ from R rake targets on age, educ, income cutoffs, and race x region
+
+stata_ipf_targets <- list(
+  gender = c("Male" = 49.0, "Female" = 51.0),
+
+  # Stata IPF age: 26.0 / 31.4 / 22.6 (vs. R rake 26.2 / 30.9 / 22.9)
+  age = c("18-29" = 20.0, "30-44" = 26.0, "45-64" = 31.4, "65+" = 22.6),
+
+  # Stata IPF educ: 37.5 / 29.0 / 20.7 / 12.8 (vs. R rake 37.3 / 28.5 / 21.0 / 13.2)
+  educ = c("HS or less" = 37.5, "Some college" = 29.0, "College" = 20.7, "Graduate" = 12.8),
+
+  # Stata IPF income brackets differ: $30k-$59,999 = codes 5-10, $60k-$99,999 = codes 11-18,
+  # $100k-$149,999 = codes 19-20 only, $150k+ = codes 21-24 only (no "prefer not to answer")
+  # targets: 17.4 / 20.5 / 38.6 / 23.6 / (last two not used here — see note)
+  # Stata ipfweight has 5 income values: 18.4 20.6 22.1 17.4 21.5
+  # Those come AFTER pid (45.9 7.4 46.7), cross-check the ordering in line 175:
+  # gender(2) age(4) educ(4) inc5(5) pid3(3) race_eth_reg(16) = 34 values total
+  # Line 175 values in order:
+  #   gender:       49.0 51.0
+  #   age:          20.0 26.0 31.4 22.6
+  #   educ:         37.5 29.0 20.7 12.8
+  #   inc5:         18.4 20.6 22.1 17.4 21.5
+  #   pid3:         45.9 7.4 46.7
+  #   race_eth_reg: 10.83 1.89 2.70 1.59 15.26 2.05 1.88 1.39 22.25 7.12 7.60 1.88 12.17 1.06 7.27 3.06
+  inc5 = c("Up to $29,999" = 18.4, "$30,000-$59,999" = 20.6,
+           "$60,000-$99,999" = 22.1, "$100,000-$149,999" = 17.4, "$150,000+" = 21.5),
+
+  # Stata PID order: 1=Dem, 2=Ind, 3=Rep
+  pid3 = c("Democrat" = 45.9, "Independent" = 7.4, "Republican" = 46.7),
+
+  # Stata IPF race x region targets (from line 175, and comment on line 86)
+  race_eth_reg = c(
+    "NE White" = 10.83, "NE Black" = 1.89,  "NE Hispanic" = 2.70,  "NE Other" = 1.59,
+    "MW White" = 15.26, "MW Black" = 2.05,  "MW Hispanic" = 1.88,  "MW Other" = 1.39,
+    "S White"  = 22.25, "S Black"  = 7.12,  "S Hispanic"  = 7.60,  "S Other"  = 1.88,
+    "W White"  = 12.17, "W Black"  = 1.06,  "W Hispanic"  = 7.27,  "W Other"  = 3.06
+  )
+)
+
+r_rake_targets <- list(
+  gender = c("Male" = 49.0, "Female" = 51.0),
+  age    = c("18-29" = 20.0, "30-44" = 26.2, "45-64" = 30.9, "65+" = 22.9),
+  educ   = c("HS or less" = 37.3, "Some college" = 28.5, "College" = 21.0, "Graduate" = 13.2),
+  inc5   = c("Up to $29,999" = 16.8, "$30,000-$59,999" = 19.6,
+             "$60,000-$99,999" = 20.8, "$100,000-$149,999" = 16.7, "$150,000+" = 26.1),
+  pid3   = c("Democrat" = 45.0, "Independent" = 9.0, "Republican" = 46.0),
+  race_eth_reg = c(
+    "NE White" = 10.9,  "NE Black" = 1.78, "NE Hispanic" = 2.56,  "NE Other" = 2.04,
+    "MW White" = 15.1,  "MW Black" = 1.92, "MW Hispanic" = 1.69,  "MW Other" = 1.65,
+    "S White"  = 21.4,  "S Black"  = 6.82, "S Hispanic"  = 7.16,  "S Other"  = 3.33,
+    "W White"  = 11.5,  "W Black"  = 1.02, "W Hispanic"  = 6.71,  "W Other"  = 4.3
+  )
+)
+
+# Show target differences side by side
+cat("\n=== Target Differences (Stata IPF vs. R rake) ===\n")
+for (v in names(stata_ipf_targets)) {
+  ipf <- stata_ipf_targets[[v]]
+  rake <- r_rake_targets[[v]]
+  out <- data.frame(
+    category    = names(ipf),
+    stata_ipf   = as.numeric(ipf),
+    r_rake      = as.numeric(rake),
+    diff        = round(as.numeric(rake) - as.numeric(ipf), 2)
+  )
+  cat("\n---", v, "---\n")
+  print(out)
+}
+
+
+# Weighted margin validation (each vs. their own targets)
+# Uses the variable names from R rake file; adjust stata_ipf names if CSV differs
+
+wprop <- function(df, var, wgt = "wgtpi") {
+  df <- df[!is.na(df[[wgt]]) & !is.na(df[[var]]), ]
+  xt <- xtabs(as.formula(paste(wgt, "~", var)), data = df)
+  round(as.numeric(xt) / sum(as.numeric(xt)) * 100, 2)
+}
+
+# Variable name mapping: list(var_in_stata_file = var_in_r_file)
+# Adjust left-hand names if Stata CSV uses different column names
+varmap <- list(
+  gender_cat       = "gender_cat",
+  age_cat          = "age_cat",
+  educ_cat         = "educ_cat",
+  inc5_cat         = "inc5_cat",
+  pid3_cat         = "pid3_cat",
+  race_eth_reg     = "race_eth_reg_cat"
+)
+
+ipf_target_list <- list(
+  gender_cat       = stata_ipf_targets$gender,
+  age_cat          = stata_ipf_targets$age,
+  educ_cat         = stata_ipf_targets$educ,
+  inc5_cat         = stata_ipf_targets$inc5,
+  pid3_cat         = stata_ipf_targets$pid3,
+  race_eth_reg     = stata_ipf_targets$race_eth_reg
+)
+
+cat("\n=== Weighted Margins: Stata IPF weights vs. Stata IPF targets ===\n")
+for (var in names(varmap)) {
+  if (!var %in% names(stata_ipf)) { cat("\nSkipping", var, "— not in Stata data\n"); next }
+  w   <- wprop(stata_ipf, var)
+  tgt <- as.numeric(ipf_target_list[[var]])
+  cat("\n---", var, "---\n")
+  print(data.frame(
+    category = names(ipf_target_list[[var]]),
+    target   = tgt,
+    weighted = w,
+    diff     = round(w - tgt, 2)
+  ))
+}
+
+cat("\n=== Weighted Margins: R rake weights vs. R rake targets ===\n")
+rake_target_list <- list(
+  gender_cat       = r_rake_targets$gender,
+  age_cat          = r_rake_targets$age,
+  educ_cat         = r_rake_targets$educ,
+  inc5_cat         = r_rake_targets$inc5,
+  pid3_cat         = r_rake_targets$pid3,
+  race_eth_reg     = r_rake_targets$race_eth_reg
+)
+for (var in names(varmap)) {
+  var_r <- varmap[[var]]
+  if (!var_r %in% names(r_rake)) { cat("\nSkipping", var_r, "— not in R data\n"); next }
+  w   <- wprop(r_rake, var_r)
+  tgt <- as.numeric(rake_target_list[[var]])
+  cat("\n---", var_r, "---\n")
+  print(data.frame(
+    category = names(rake_target_list[[var]]),
+    target   = tgt,
+    weighted = w,
+    diff     = round(w - tgt, 2)
+  ))
+}
+
+
+# Individual weight correlation (matched on caseid)
+if ("caseid" %in% names(stata_ipf) & "caseid" %in% names(r_rake)) {
+  merged <- inner_join(
+    stata_ipf %>% select(caseid, wgtpi) %>% rename(wgtpi_stata = wgtpi),
+    r_rake    %>% select(caseid, wgtpi) %>% rename(wgtpi_r     = wgtpi),
+    by = "caseid"
+  ) %>% filter(!is.na(wgtpi_stata) & !is.na(wgtpi_r))
+
+  cat("\n=== Individual Weight Correlation ===\n")
+  cat("N matched cases:         ", nrow(merged), "\n")
+  cat("Pearson r:               ", round(cor(merged$wgtpi_stata, merged$wgtpi_r), 4), "\n")
+  cat("Mean absolute difference:", round(mean(abs(merged$wgtpi_stata - merged$wgtpi_r)), 4), "\n")
+  cat("Max absolute difference: ", round(max( abs(merged$wgtpi_stata - merged$wgtpi_r)), 4), "\n")
+
+  plot(merged$wgtpi_stata, merged$wgtpi_r,
+       xlab = "Stata IPF weights", ylab = "R rake weights",
+       main = "Weight correlation", pch = 16, col = rgb(0, 0, 0, 0.2))
+  abline(0, 1, col = "red", lty = 2)
+
+} else {
+  cat("\nNo shared 'caseid' found — skipping individual correlation.\n")
+}
+
+# Very close -- r = .98
+# However there is a max difference of ~3.3; worth checking
+merged %>%
+  mutate(abs_diff = abs(wgtpi_stata - wgtpi_r)) %>%
+  arrange(desc(abs_diff)) %>%
+  head(20) %>%
+  left_join(
+    r_rake %>% select(caseid, gender_cat, age_cat, educ_cat, inc5_cat, pid3_cat, race_eth_reg_cat),
+    by = "caseid"
+  )
+# virtually every high-divergence case is S Other + $150k+, with one W Other + $150k+. These are the two cells where R rake targets diverge most from Stata IPF (S Other: 3.33 vs. 1.88; $150k+: 26.1 vs. 21.5), and the raking algorithm is compounding those differences for respondents who fall in both simultaneously. Nothing necessarily wrong with either set
+
+# Substantive outcome spot-check
+outcomes <- c("Q220_1", "Q220_2", "Q78")
+
+cat("\n=== Weighted Outcome Means (spot check) ===\n")
+cat(sprintf("%-10s  %9s  %9s  %8s\n", "variable", "Stata_IPF", "R_rake", "diff"))
+for (v in outcomes) {
+  if (!v %in% names(stata_ipf) | !v %in% names(r_rake)) next
+  m_ipf  <- weighted.mean(stata_ipf[[v]], stata_ipf$wgtpi, na.rm = TRUE)
+  m_rake <- weighted.mean(r_rake[[v]],    r_rake$wgtpi,    na.rm = TRUE)
+  cat(sprintf("%-10s  %9.3f  %9.3f  %8.3f\n", v, m_ipf, m_rake, m_rake - m_ipf))
+}
+# weights are working correctly. Both implementations hit their respective targets closely, and the outcome means (Q220_1, Q220_2, Q78) are essentially identical across the two weighting schemes — differences of 0.03 or less. That's strong evidence the two approaches are producing substantively equivalent results despite the methodological differences (IPF in Stata vs. survey::rake in R).
+```
+
+Survey Codebook
+
+[Age; Q2] What is your age?
+•	Younger than 18 (1, excluded)
+•	18–29 (2)
+•	30–44 (3)
+•	45–64 (4)
+•	65 or older (5)
+
+[Gender, Q3] Are you…
+•	Female (1)
+•	Male (2)
+
+[Hispanic Ethnicity, Q4] Do you identify as Hispanic or Latino?
+•	Yes (1)
+•	No (2)
+
+[Race, Q5] Which racial group describes you the most?
+•	White (1)
+•	Black (2)
+•	Asian (3)
+•	Native American (4)
+•	Pacific Islander (5)
+•	Middle Eastern or North African (6)
+Race and ethnicity were recoded into four mutually exclusive dummy variables for analysis. Respondents who answered “yes” to the Hispanic ethnicity question were coded as Hispanic regardless of the racial category they selected. Among respondents who indicated they were not Hispanic, those who selected White were coded as non-Hispanic White, those who selected Black were coded as non-Hispanic Black, and all remaining racial selections (including Asian, Native American, Pacific Islander, Middle Eastern or North African, or any other category) were coded as Other race.
+
+[Party Identification, Q10] Do you consider yourself a Democrat, a Republican, or an Independent?
+•	Democrat (1)
+•	Republican (2)
+•	Independent (3)
+
+[Party Lean, Q13] Do you consider yourself to be leaning Democrat, leaning Republican or neither?
+•	Leaning Democrat (1)
+•	Leaning Republican (2)
+•	Neither (3)
