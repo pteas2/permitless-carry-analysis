@@ -4,6 +4,8 @@ Replication code for:
 
 **Teas, P.E., Rozario, T.D., & Filindra, A. (2026). Firearm Carrying and Purchase Intentions in Permitless Carry States: State Policy or State Culture?**
 
+Preprint: https://doi.org/10.31234/osf.io/asxjv_v1
+
 ## Overview
 
 This study examines associations between state permitless carry laws and individual-level firearm behaviors using a nationally representative survey of 18,251 U.S. adults (2024-2025). We find that while residents of permitless carry states report higher rates of gun ownership, carrying, and purchase intentions, these associations largely disappear after accounting for state-level political context (Trump vote share) and gun-ownership rates.
