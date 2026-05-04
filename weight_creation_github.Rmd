@@ -3,7 +3,7 @@ output: console
 ---
 
 Weight Creation Script
-ACS 2024
+Weighted using ACS 2024
 Variables:
 - Numeric: gender_num, age_num, educ_num, inc5_num, pid3_num, race_eth_reg_num
 - Factor: gender_cat, age_cat, educ_cat, inc5_cat, pid3_cat, race_eth_reg_cat
@@ -12,15 +12,8 @@ Variables:
 
 # Worth noting that the weighting here we are doing is on an op-in panel. This isn't a deal where we're weighting to correct for sampling probabilities. We have no sampling frame because we have no idea why any given person ended up in the sample. We're essentially weighting as an act of faith to make it closer to something representative of the true population
 
-# Reasoning behind the raking variables:
-  # Gender, age, education are typical raking vars.
-  # Income - opt-in panels tend to skew more middle-income, and potentially relevant for outcomes
-  # Race x Region is more precise to the racial imbalances across the country and is theorized to be important especially in terms of gun culture
-  # PID is relevant to the outcomes of interest—only problematic if the lurking variable that leads to under/over-representation of certain political groups also affects our outcomes of interest
-
 # Can't correct for the fact that people in opt-in panels likely differ from the general population in important ways
 
-# Notes with a bit more info that I didn't want to write down from Claude:
 # RAKING OVERVIEW
 
 # Raking (iterative proportional fitting) adjusts each respondent's weight so
@@ -62,20 +55,21 @@ Variables:
 # Library setup
 library(data.table) # For fread() -- query a CSV directly without loading it into memory
 library(survey) # For survey::rake
-library(tidyverse) # I rely on the %>% operator from {tidyverse}
+library(tidyverse) # I rely on the %>% operator from tidyverse
 ```
 
+ACS Data to create targets; very large and takes up memory so commented out; margins already calculated in prior sessions and now input manually after the next three chunks
 ```{r Load acs data, eval=FALSE}
 # # Originally used ACS PUMS to derive population targets, but the files are huge and it takes a lot of memory so can skip to the chunks below
 # # We get the pid and income estimates from other sources anyway
 # 
 # # Census data is huge, so selectively read in the variables we need
 # a <- fread(
-#   "~/Library/CloudStorage/GoogleDrive-pauleteas@gmail.com/My Drive/Research/PROJECTS/Bedrock/weight_creation/csv_pus/psam_pusa.csv",
+#   "data/psam_pusa.csv",
 #   select = c("HISP", "AGEP", "REGION", "RAC1P", "SCHL", "SEX", "PWGTP")
 # )
 # b <- fread(
-#   "~/Library/CloudStorage/GoogleDrive-pauleteas@gmail.com/My Drive/Research/PROJECTS/Bedrock/weight_creation/csv_pus/psam_pusb.csv",
+#   "data/psam_pusb.csv",
 #   select = c("HISP", "AGEP", "REGION", "RAC1P", "SCHL", "SEX", "PWGTP")
 # )
 # 
@@ -185,10 +179,9 @@ library(tidyverse) # I rely on the %>% operator from {tidyverse}
 # rm(acs) # Clear ACS to save memory
 ```
 
+Supplementary census data to create income targets; can run but can also skip; margins calculated in following chunk
 ```{r Calculate income targets from Census table}
-# NOTE: Income is NOT available in the ACS PUMS raw data files we used above.
-# Instead, we calculate income distribution targets from the Census Bureau's
-# Current Population Survey (CPS) HINC-06 table: "Income Distribution to $250,000 or More for Households"
+# Income wasn't available in the ACS PUMS raw data files we used above so we calculate income distribution targets from the Census Bureau's Current Population Survey (CPS) HINC-06 table: "Income Distribution to $250,000 or More for Households"
 # Source: https://www.census.gov/data/tables/2025/demo/cps/hinc-06.html
 # Data file: income.csv (extracted from HINC-06 table for 2024)
 
@@ -463,8 +456,7 @@ dat <- dat %>%
     # Income with labels
     inc5_cat = factor(inc5_num,
               levels = 1:5,
-              labels = c("Up to $29,999", "$30,000-$59,999", "$60,000-$99,999",
-                               "$100,000-$149,999", "$150,000+")),
+              labels = c("Up to $29,999", "$30,000-$59,999", "$60,000-$99,999", "$100,000-$149,999", "$150,000+")),
 
     # Party ID with labels
     pid3_cat = factor(pid3_num,
@@ -589,14 +581,10 @@ dat_complete <- dat_complete %>%
     # Normalize to mean of 1 before trimming
     wgtpi = wgtpi / mean(wgtpi),
     # Cap at 7, floor at 0.2
-    # Cap chosen to match colleague's Stata implementation; allows correction
-    # for hard-to-reach demographic cells without any single respondent
-    # dominating weighted estimates. A cap of 5 is more conservative.
+    # Cap allows correction for hard-to-reach demographic cells without any single respondent dominating weighted estimates. Cap of 5 would be more conservative
     wgtpi = pmin(wgtpi, 7),
     wgtpi = pmax(wgtpi, 0.2)
-    # Note: we do NOT re-normalize after trimming -- doing so would push
-    # trimmed-at-7 cases above the cap. Weights are already close to mean 1
-    # after the normalize-then-trim sequence.
+    # Note: we do NOT re-normalize after trimming -- doing so would push trimmed-at-7 cases above the cap. Weights are already close to mean 1 after the normalize-then-trim sequence
   )
 
 summary(dat_complete$wgtpi)
@@ -649,44 +637,44 @@ wprop <- function(x, w) {
 }
 
 w_gender <- wprop(dat_complete$gender_num, dat_complete$wgtpi)
-print(data.frame(
+data.frame(
   category = c("Male", "Female"),
   target = as.numeric(target_gender),
   weighted = w_gender,
   diff = w_gender - as.numeric(target_gender)
-))
+)
 
 w_age <- wprop(dat_complete$age_num, dat_complete$wgtpi)
-print(data.frame(
+data.frame(
   category = c("18-29", "30-44", "45-64", "65+"),
   target = as.numeric(target_age),
   weighted = w_age,
   diff = w_age - as.numeric(target_age)
-))
+)
 
 w_educ <- wprop(dat_complete$educ_num, dat_complete$wgtpi)
-print(data.frame(
+data.frame(
   category = c("HS or less", "Some college", "College", "Graduate"),
   target = as.numeric(target_educ),
   weighted = w_educ,
   diff = w_educ - as.numeric(target_educ)
-))
+)
 
 w_inc5 <- wprop(dat_complete$inc5_num, dat_complete$wgtpi)
-print(data.frame(
+data.frame(
   category = c("<$30k", "$30-60k", "$60-100k", "$100-150k", "$150k+"),
   target = as.numeric(target_inc5),
   weighted = w_inc5,
   diff = w_inc5 - as.numeric(target_inc5)
-))
+)
 
 w_pid3 <- wprop(dat_complete$pid3_num, dat_complete$wgtpi)
-print(data.frame(
+data.frame(
   category = c("Democrat", "Independent", "Republican"),
   target = as.numeric(target_pid3),
   weighted = w_pid3,
   diff = w_pid3 - as.numeric(target_pid3)
-))
+)
 
 w_race_eth_reg <- wprop(dat_complete$race_eth_reg_num, dat_complete$wgtpi)
 race_eth_labels <- c(
@@ -695,12 +683,12 @@ race_eth_labels <- c(
   "S White", "S Black", "S Hispanic", "S Other",
   "W White", "W Black", "W Hispanic", "W Other"
 )
-print(data.frame(
+data.frame(
   category = race_eth_labels,
   target = as.numeric(target_race_eth_reg),
   weighted = w_race_eth_reg,
   diff = w_race_eth_reg - as.numeric(target_race_eth_reg)
-))
+)
 ```
 
 ```{r Merge and save}
@@ -712,13 +700,11 @@ dat_final <- dat %>%
   )
 
 nrow(dat_final)
-# Weighted N
 sum(!is.na(dat_final$wgtpi))
-# Unweighted N
 sum(is.na(dat_final$wgtpi))
 
 # Save the weighted data
-write.csv(dat_final, "data/data_weighted_r.csv", row.names = FALSE)
+#write.csv(dat_final, "data/data_weighted_r.csv", row.names = FALSE)
 ```
 
 Comparison: Stata IPF vs. R survey::rake implementations
@@ -729,29 +715,28 @@ Comparison: Stata IPF vs. R survey::rake implementations
 stata_ipf <- read.csv("data/data_weighted_stata.csv", stringsAsFactors = FALSE)
 r_rake <- dat_final
 
-cat("Stata IPF N:           ", nrow(stata_ipf),                    "\n")
-cat("R rake N:              ", nrow(r_rake),                       "\n")
-cat("Stata IPF weighted N:  ", sum(!is.na(stata_ipf$wgtpi)),       "\n")
-cat("R rake weighted N:     ", sum(!is.na(r_rake$wgtpi)),          "\n")
-
-# Both Ns are the same, same people and same order. Can generate matching case IDs
+# Check weighted and unweighted ns to make sure the stata and r data match
+nrow(stata_ipf)
+nrow(r_rake)
+sum(!is.na(stata_ipf$wgtpi))
+sum(!is.na(r_rake$wgtpi))
+# Both Ns are the same, same people and same order
+# Can generate matching case IDs
 stata_ipf$caseid <- seq_len(nrow(stata_ipf))
 r_rake$caseid <- seq_len(nrow(r_rake))
 
 # Weight distribution
-cat("\n=== Weight Distribution ===\n")
-cat("\nStata IPF weights:\n");  print(summary(stata_ipf$wgtpi))
-cat("\nR rake weights:\n");     print(summary(r_rake$wgtpi))
+summary(stata_ipf$wgtpi)
+summary(r_rake$wgtpi)
 
-par(mfrow = c(1, 2))
+par(mfrow = c(1, 2)) # display two plots side by side
 hist(stata_ipf$wgtpi, breaks = 50, main = "Stata IPF weights",  xlab = "wgtpi", col = "steelblue")
 hist(r_rake$wgtpi,    breaks = 50, main = "R rake weights",     xlab = "wgtpi", col = "coral")
-par(mfrow = c(1, 1))
-
+par(mfrow = c(1, 1)) # back to one plot at a time
 
 # Targets as coded in Stata IPF do-file (line 175)
 # ipfweight order: gender age educ inc5 pid3 race_eth_reg
-# NOTE: Stata IPF targets differ from R rake targets on age, educ, income cutoffs, and race x region
+# NOTE: Stata IPF targets differ slightly from R rake targets on age, educ, income cutoffs, and race x region
 
 stata_ipf_targets <- list(
   gender = c("Male" = 49.0, "Female" = 51.0),
@@ -762,8 +747,7 @@ stata_ipf_targets <- list(
   # Stata IPF educ: 37.5 / 29.0 / 20.7 / 12.8 (vs. R rake 37.3 / 28.5 / 21.0 / 13.2)
   educ = c("HS or less" = 37.5, "Some college" = 29.0, "College" = 20.7, "Graduate" = 12.8),
 
-  # Stata IPF income brackets differ: $30k-$59,999 = codes 5-10, $60k-$99,999 = codes 11-18,
-  # $100k-$149,999 = codes 19-20 only, $150k+ = codes 21-24 only (no "prefer not to answer")
+  # Stata IPF income brackets differ: $30k-$59,999 = codes 5-10, $60k-$99,999 = codes 11-18, $100k-$149,999 = codes 19-20 only, $150k+ = codes 21-24 only (no "prefer not to answer")
   # targets: 17.4 / 20.5 / 38.6 / 23.6 / (last two not used here — see note)
   # Stata ipfweight has 5 income values: 18.4 20.6 22.1 17.4 21.5
   # Those come AFTER pid (45.9 7.4 46.7), cross-check the ordering in line 175:
@@ -790,6 +774,7 @@ stata_ipf_targets <- list(
   )
 )
 
+# List my targets again
 r_rake_targets <- list(
   gender = c("Male" = 49.0, "Female" = 51.0),
   age    = c("18-29" = 20.0, "30-44" = 26.2, "45-64" = 30.9, "65+" = 22.9),
@@ -806,7 +791,6 @@ r_rake_targets <- list(
 )
 
 # Show target differences side by side
-cat("\n=== Target Differences (Stata IPF vs. R rake) ===\n")
 for (v in names(stata_ipf_targets)) {
   ipf <- stata_ipf_targets[[v]]
   rake <- r_rake_targets[[v]]
@@ -820,10 +804,8 @@ for (v in names(stata_ipf_targets)) {
   print(out)
 }
 
-
 # Weighted margin validation (each vs. their own targets)
-# Uses the variable names from R rake file; adjust stata_ipf names if CSV differs
-
+# Using the variable names from R version
 wprop <- function(df, var, wgt = "wgtpi") {
   df <- df[!is.na(df[[wgt]]) & !is.na(df[[var]]), ]
   xt <- xtabs(as.formula(paste(wgt, "~", var)), data = df)
@@ -831,7 +813,6 @@ wprop <- function(df, var, wgt = "wgtpi") {
 }
 
 # Variable name mapping: list(var_in_stata_file = var_in_r_file)
-# Adjust left-hand names if Stata CSV uses different column names
 varmap <- list(
   gender_cat       = "gender_cat",
   age_cat          = "age_cat",
@@ -850,7 +831,7 @@ ipf_target_list <- list(
   race_eth_reg     = stata_ipf_targets$race_eth_reg
 )
 
-cat("\n=== Weighted Margins: Stata IPF weights vs. Stata IPF targets ===\n")
+# Stata IPF weights vs. Stata IPF targets
 for (var in names(varmap)) {
   if (!var %in% names(stata_ipf)) { cat("\nSkipping", var, "— not in Stata data\n"); next }
   w   <- wprop(stata_ipf, var)
@@ -864,7 +845,7 @@ for (var in names(varmap)) {
   ))
 }
 
-cat("\n=== Weighted Margins: R rake weights vs. R rake targets ===\n")
+# R rake weights vs. R rake targets
 rake_target_list <- list(
   gender_cat       = r_rake_targets$gender,
   age_cat          = r_rake_targets$age,
@@ -886,7 +867,6 @@ for (var in names(varmap)) {
     diff     = round(w - tgt, 2)
   ))
 }
-
 
 # Individual weight correlation (matched on caseid)
 if ("caseid" %in% names(stata_ipf) & "caseid" %in% names(r_rake)) {
@@ -925,8 +905,6 @@ merged %>%
 
 # Substantive outcome spot-check
 outcomes <- c("Q220_1", "Q220_2", "Q78")
-
-cat("\n=== Weighted Outcome Means (spot check) ===\n")
 cat(sprintf("%-10s  %9s  %9s  %8s\n", "variable", "Stata_IPF", "R_rake", "diff"))
 for (v in outcomes) {
   if (!v %in% names(stata_ipf) | !v %in% names(r_rake)) next
@@ -934,7 +912,7 @@ for (v in outcomes) {
   m_rake <- weighted.mean(r_rake[[v]],    r_rake$wgtpi,    na.rm = TRUE)
   cat(sprintf("%-10s  %9.3f  %9.3f  %8.3f\n", v, m_ipf, m_rake, m_rake - m_ipf))
 }
-# weights are working correctly. Both implementations hit their respective targets closely, and the outcome means (Q220_1, Q220_2, Q78) are essentially identical across the two weighting schemes — differences of 0.03 or less. That's strong evidence the two approaches are producing substantively equivalent results despite the methodological differences (IPF in Stata vs. survey::rake in R).
+# weights are working correctly. Both implementations hit their respective targets closely, and the outcome means (Q220_1, Q220_2, Q78) are essentially identical across the two weighting schemes — differences of 0.03 or less. Strong evidence the two approaches are producing substantively equivalent results despite the methodological differences.
 ```
 
 Survey Codebook
